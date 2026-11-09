@@ -1,0 +1,19 @@
+{
+  "name": "ghost-stream-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ephemeral encrypted peer-link web client — zero-retention memory model",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "serve": "serve dist -l 5173",
+    "test": "node tests/memory.test.js && node tests/security.test.js && node tests/core.test.js && node tests/webrtc.test.js && node tests/qr.test.js",
+    "selftest:memory": "node tests/memory.test.js"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0",
+    "serve": "^14.2.0"
+  }
+}

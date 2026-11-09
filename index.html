@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#050608" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="GHOST-STREAM — ephemeral encrypted peer link"
+    />
+    <title>GHOST-STREAM // Tactical Uplink</title>
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="stylesheet" href="./src/ui/styles.css" />
+  </head>
+  <body>
+    <div class="fx-overlay" aria-hidden="true"></div>
+    <div class="app-shell" id="shell">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="GHOST-STREAM home">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span class="brand-name">GHOST<span>-STREAM</span></span>
+          <span class="version-tag">FIELD LINK <i>0.1</i></span>
+        </a>
+
+        <div class="room-panel glass-panel" aria-label="Room controls">
+          <div class="room-readout">
+            <span class="eyebrow">ROOM CODE</span>
+            <code class="room-code" id="roomCodeDisplay" data-room-code>----</code>
+            <button class="icon-button copy-button" id="copyRoom" type="button" aria-label="Copy room code" title="Copy room code">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="8" y="8" width="12" height="12" rx="2"></rect>
+                <path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"></path>
+              </svg>
+            </button>
+          </div>
+          <div class="room-actions">
+            <button class="button button-subtle" id="btnCreateRoom" type="button">CREATE ROOM</button>
+            <button class="button button-subtle" id="btnJoinRoom" type="button">JOIN ROOM</button>
+            <button class="button button-subtle" id="btnQr" type="button" disabled aria-label="Show rotating room invitation QR code">[QR]</button>
+          </div>
+        </div>
+
+        <div class="session-actions">
+          <div class="timer-panel" id="sessionTimer" title="Time remaining before volatile session purge">
+            <span class="eyebrow">PURGE IN</span>
+            <time class="timer-value" id="timerDisplay">02:00:00</time>
+          </div>
+          <button class="button button-purge" id="btnNuke" type="button" aria-label="Instantly purge this session">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3 2.8 19a1.4 1.4 0 0 0 1.2 2.1h16a1.4 1.4 0 0 0 1.2-2.1L12 3Z"></path>
+              <path d="M12 9v5m0 3h.01"></path>
+            </svg>
+            <span>INSTANT PURGE</span>
+          </button>
+        </div>
+      </header>
+
+      <main class="stage">
+        <section class="video-primary" aria-label="Remote video stream">
+          <video id="videoRemote" autoplay playsinline></video>
+          <div class="video-fallback" id="remoteFallback">
+            <div class="radar" aria-hidden="true">
+              <span class="radar-ring radar-ring-one"></span>
+              <span class="radar-ring radar-ring-two"></span>
+              <span class="radar-ring radar-ring-three"></span>
+              <span class="radar-axis radar-axis-x"></span>
+              <span class="radar-axis radar-axis-y"></span>
+              <span class="radar-sweep"></span>
+              <span class="radar-center"></span>
+              <span class="radar-cardinal radar-cardinal-n">N</span>
+              <span class="radar-cardinal radar-cardinal-e">E</span>
+              <span class="radar-cardinal radar-cardinal-s">S</span>
+              <span class="radar-cardinal radar-cardinal-w">W</span>
+            </div>
+            <span class="fallback-coordinate">SECURE CHANNEL // STANDBY</span>
+            <span class="fallback-title">NO CARRIER</span>
+            <span class="fallback-copy">AWAITING SECURE PEER LINK</span>
+            <span class="fallback-hint"><kbd>C</kbd> create room <i></i> <kbd>J</kbd> join room</span>
+          </div>
+          <div class="video-brackets" aria-hidden="true">
+            <i></i><i></i><i></i><i></i>
+          </div>
+          <div class="video-grid" aria-hidden="true"></div>
+          <div class="video-tag video-tag--remote">
+            <span class="status-dot" data-state="idle"></span>
+            <span id="remoteTagLabel">REMOTE // AWAITING LINK</span>
+          </div>
+          <div class="video-coordinate video-coordinate--top" aria-hidden="true">GS / NODE 01 <span>•</span> P2P ENCRYPTED</div>
+          <div class="stream-meta" aria-hidden="true">
+            <span>DIRECT PEER LINK</span>
+            <span class="stream-meta-separator"></span>
+            <span>END-TO-END</span>
+          </div>
+        </section>
+
+        <aside class="proximity-panel glass-panel" aria-label="Peer proximity radar">
+          <div class="proximity-heading">
+            <span class="eyebrow">01 / PROXIMITY</span>
+            <span class="proximity-mode" id="radarStatus">SCANNING</span>
+          </div>
+          <div class="proximity-scope" aria-hidden="true">
+            <span class="proximity-ring proximity-ring-10"><i>10m</i></span>
+            <span class="proximity-ring proximity-ring-25"><i>25m</i></span>
+            <span class="proximity-ring proximity-ring-50"><i>50m</i></span>
+            <span class="proximity-axis proximity-axis-x"></span>
+            <span class="proximity-axis proximity-axis-y"></span>
+            <span class="proximity-sweep"></span>
+            <span class="proximity-origin"></span>
+          </div>
+          <ul class="radar-peer-list" id="radarPeers" aria-live="polite"></ul>
+          <p class="proximity-disclaimer">RANGE REQUIRES CALIBRATED RSSI // P2P REPORTS RTT</p>
+        </aside>
+
+        <section class="video-pip glass-panel" aria-label="Local camera preview">
+          <video id="videoLocal" autoplay playsinline muted></video>
+          <div class="pip-placeholder" aria-hidden="true">
+            <span class="pip-placeholder-icon">CAM</span>
+            <span>LOCAL PREVIEW</span>
+          </div>
+          <div class="video-tag video-tag--local">
+            <span class="status-dot" data-state="live"></span>
+            <span>LOCAL</span>
+          </div>
+          <div class="audio-level" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          </div>
+        </section>
+
+        <aside
+          class="chat-drawer collapsed"
+          id="chatDrawer"
+          aria-label="Ephemeral chat"
+          aria-expanded="false"
+        >
+          <div class="chat-head">
+            <div>
+              <span class="eyebrow">SECURE MESSAGING</span>
+              <span class="chat-head-status"><i></i> RAM ONLY // ZERO RETENTION</span>
+            </div>
+            <button class="icon-button close-chat" id="closeChat" type="button" aria-label="Close chat">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>
+            </button>
+          </div>
+          <div class="chat-log" id="chatLog" aria-live="polite" aria-relevant="additions text" role="log">
+            <p class="chat-notice">Messages remain in memory only and disappear when this session ends.</p>
+          </div>
+          <form class="chat-compose" id="chatForm" autocomplete="off">
+            <span class="compose-prefix" aria-hidden="true">&gt;</span>
+            <input
+              id="chatInput"
+              name="throwaway-no-persist"
+              type="text"
+              maxlength="512"
+              disabled
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="> waiting for secure peer link..."
+              aria-label="Message to transmit"
+            />
+            <button class="button button-send" id="chatSendBtn" type="submit" disabled aria-label="Send message">SEND</button>
+          </form>
+        </aside>
+
+        <nav class="control-dock" aria-label="Call controls">
+          <button class="dock-button" id="btnAudio" type="button" data-active="false" data-tooltip="Toggle microphone" aria-label="Toggle microphone" aria-pressed="false" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="9" y="2" width="6" height="12" rx="3"></rect>
+              <path d="M5 10v2a7 7 0 0 0 14 0v-2m-7 9v3m-4 0h8"></path>
+            </svg>
+            <span class="dock-label">MIC</span>
+            <span class="dock-state" id="audioState">OFF</span>
+          </button>
+          <span class="dock-divider" aria-hidden="true"></span>
+          <button class="dock-button" id="btnVideo" type="button" data-active="false" data-tooltip="Toggle camera" aria-label="Toggle camera" aria-pressed="false" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3" y="6" width="13" height="12" rx="2"></rect>
+              <path d="m16 10 5-3v10l-5-3"></path>
+            </svg>
+            <span class="dock-label">CAM</span>
+            <span class="dock-state" id="videoState">OFF</span>
+          </button>
+          <span class="dock-divider" aria-hidden="true"></span>
+          <button class="dock-button" id="btnChat" type="button" data-active="false" data-tooltip="Open ephemeral chat" aria-label="Open ephemeral chat" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-2 2v-9.5A7.5 7.5 0 0 1 10.5 4h2A7.5 7.5 0 0 1 20 11.5Z"></path>
+              <path d="M8 11h.01M12 11h.01M16 11h.01"></path>
+            </svg>
+            <span class="dock-label">CHAT</span>
+            <span class="dock-state" id="chatState">HIDDEN</span>
+          </button>
+          <span class="dock-divider" aria-hidden="true"></span>
+          <button class="dock-button dock-button-panic" id="btnPanic" type="button" data-active="false" data-tooltip="Destroy session and purge memory" aria-label="Panic: destroy session">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3 2.8 19a1.4 1.4 0 0 0 1.2 2.1h16a1.4 1.4 0 0 0 1.2-2.1L12 3Z"></path>
+              <path d="M12 9v5m0 3h.01"></path>
+            </svg>
+            <span class="dock-label">PANIC</span>
+            <span class="dock-state" id="panicState">ARMED</span>
+          </button>
+        </nav>
+      </main>
+    </div>
+
+    <div class="invite-overlay hidden" id="inviteModal" role="dialog" aria-modal="true" aria-labelledby="inviteTitle" aria-hidden="true">
+      <section class="invite-card glass-panel">
+        <div class="modal-heading">
+          <div>
+            <span class="eyebrow">HOST ACCESS // VOLATILE CAPABILITY</span>
+            <h2 id="inviteTitle">SINGLE-USE INVITE</h2>
+          </div>
+          <button class="icon-button" id="closeInvite" type="button" aria-label="Close invite QR">×</button>
+        </div>
+        <div class="invite-qr-frame">
+          <svg id="inviteQr" xmlns="http://www.w3.org/2000/svg"></svg>
+        </div>
+        <p class="invite-countdown" id="inviteCountdown">BURNS IN 60s</p>
+        <p class="invite-status" id="inviteStatus">GENERATING SECURE INVITE…</p>
+        <p class="invite-warning">The QR contains a temporary room capability. Keep it private; it rotates every 60 seconds.</p>
+      </section>
+    </div>
+
+    <div class="knock-overlay hidden" id="knockModal" role="dialog" aria-modal="true" aria-labelledby="knockTitle" aria-hidden="true">
+      <section class="knock-card glass-panel">
+        <span class="eyebrow">INCOMING LINK ATTEMPT</span>
+        <h2 id="knockTitle">PEER: <code id="knockPeer">--------</code></h2>
+        <p>Review the request before opening signaling and media negotiation.</p>
+        <p class="knock-countdown">AUTO-REJECT IN <span id="knockCountdown">30s</span></p>
+        <div class="knock-actions">
+          <button class="button authorize-button" id="approveKnock" type="button">AUTHORIZE LINK</button>
+          <button class="button reject-button" id="rejectKnock" type="button">REJECT &amp; PURGE</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="pending-overlay hidden" id="pendingApproval" role="status" aria-live="assertive" aria-hidden="true">
+      <div class="pending-card glass-panel">
+        <div class="pending-radar" aria-hidden="true"><i></i></div>
+        <span class="eyebrow">HOST GATEKEEPER // NO MEDIA LINK</span>
+        <strong>&gt; WAITING FOR HOST CLEARANCE...</strong>
+        <button class="button button-subtle" id="cancelPendingJoin" type="button">CANCEL REQUEST</button>
+      </div>
+    </div>
+
+    <div class="purge-overlay hidden" id="purgeOverlay" role="alertdialog" aria-live="assertive">
+      <div class="purge-card">
+        <span class="purge-icon" aria-hidden="true">!</span>
+        <span class="eyebrow">SESSION TERMINATED</span>
+        <h1>VOLATILE STATE PURGED</h1>
+        <p>Media, channels, and in-memory session buffers have been cleared.</p>
+        <button class="button button-recover" id="btnRecover" type="button">RE-INITIALIZE</button>
+      </div>
+    </div>
+
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>
