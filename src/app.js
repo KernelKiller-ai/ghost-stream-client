@@ -618,17 +618,22 @@ function handleToggleMedia(kind) {
 /** Connect signaling, join the room, arm the 2-hour purge countdown. */
 async function connectAndArm(code, { token, isHost }) {
   if (signaling.isConnected && signaling.room) signaling.leaveRoom();
-  else {
-    signaling.room = null;
-    signaling.roomToken = null;
-    signaling.isHost = false;
+  signaling.room = code;
+  signaling.roomToken = token;
+  signaling.isHost = Boolean(isHost);
+
+  if (!signaling.isConnected) {
+    try {
+      await signaling.connect();
+    } catch {
+      chat.system(
+        "signaling backend is waking up from sleep; auto-reconnecting in background...",
+      );
+    }
   }
-  if (!signaling.isConnected) await signaling.connect();
   cryptoHandshakePromise = null;
   sessionCrypto.zeroize();
-  if (!signaling.joinRoom(code, { token, isHost })) {
-    throw new Error("signaling join could not be sent");
-  }
+  signaling.joinRoom(code, { token, isHost });
 
   // autoPurge: 7200s reverse countdown ticking the header clock.
   stopSession();
@@ -816,9 +821,19 @@ signaling.onPeerLeft = (peerId) => {
   }
 };
 
+signaling.onOpen = () => {
+  chat.system("signaling connected");
+};
+
 signaling.onDisconnect = (willRetry, attempts) => {
   chat.system(
     willRetry ? `signaling down — retry #${attempts}` : "signaling lost",
+  );
+};
+
+signaling.onReconnecting = (attempt, delayMs) => {
+  chat.system(
+    `reconnecting to signaling in ${Math.round(delayMs / 100) / 10}s (attempt #${attempt})…`,
   );
 };
 

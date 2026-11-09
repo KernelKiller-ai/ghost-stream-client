@@ -23,12 +23,17 @@
  *   <- { type: "error", message }
  * ============================================================ */
 
-/** Default signaling endpoint (same host, ws/wss auto-selected). */
-const DEFAULT_URL = (() => {
-  if (typeof location === "undefined") return "ws://localhost:8787";
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}/ws`;
-})();
+/**
+ * Resolved signaling endpoint strictly prioritizing Vite's environment variable.
+ * Fallback connects to local backend or dedicated Render signaling server with root path.
+ */
+export const SIGNALING_URL =
+  (typeof import.meta !== "undefined" && import.meta.env?.VITE_SIGNALING_URL) ||
+  ((typeof window !== "undefined" ? window.location.hostname : "localhost") === "localhost"
+    ? "ws://localhost:10000"
+    : "wss://ghost-stream-backend.onrender.com");
+
+export const DEFAULT_URL = SIGNALING_URL;
 
 /** Reconnection policy. */
 const RECONNECT = {
@@ -100,6 +105,13 @@ export class SignalingClient {
 
   /** @returns {Promise<void>} resolves once the socket is open. */
   connect() {
+    if (this.isConnected) return Promise.resolve();
+
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+
     return new Promise((resolve, reject) => {
       this._intentionalClose = false;
       let settled = false;
@@ -108,7 +120,12 @@ export class SignalingClient {
       try {
         ws = new WebSocket(this.url);
       } catch (err) {
-        reject(err);
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+        this.onError?.(err);
+        this._scheduleReconnect();
         return;
       }
       this._ws = ws;

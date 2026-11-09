@@ -2,7 +2,7 @@
 // (No real socket/camera is used — APIs are faked.)
 // Run: node client-web/tests/core.test.js
 
-const { SignalingClient } = await import("../src/core/signalingClient.js");
+const { SignalingClient, SIGNALING_URL, DEFAULT_URL } = await import("../src/core/signalingClient.js");
 const { MediaStreamController } = await import("../src/core/mediaStream.js");
 
 let failures = 0;
@@ -39,6 +39,14 @@ globalThis.WebSocket = class FakeWebSocket {
 };
 
 // ---- Signaling client ----
+const defaultSig = new SignalingClient();
+check("default url uses SIGNALING_URL", defaultSig.url === SIGNALING_URL && defaultSig.url === DEFAULT_URL);
+check("signaling url does not have trailing /ws", !defaultSig.url.endsWith("/ws"));
+check(
+  "signaling url resolves to localhost or render backend",
+  defaultSig.url === "ws://localhost:10000" || defaultSig.url === "wss://ghost-stream-backend.onrender.com",
+);
+
 const inviteToken = "A".repeat(43);
 const sig = new SignalingClient({
   url: "ws://fake",
