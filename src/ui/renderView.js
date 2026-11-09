@@ -110,7 +110,7 @@ export function applyVideoState(stream, enabled) {
   }
 }
 
-/* ---------- Ephemeral chat rendering ---------- */
+/* ---------- Ephemeral chat & telemetry rendering ---------- */
 
 /** Ring capacity — older lines fall off the face of the DOM. */
 const MAX_RENDERED_LINES = 100;
@@ -119,36 +119,114 @@ const MAX_RENDERED_LINES = 100;
  * Renderer that writes text straight into the live display and keeps
  * at most a small in-memory mirror. No browser storage APIs are
  * touched, and there is no input auto-complete/session persistence.
+ *
+ * Diagnostic telemetry and signaling notifications are routed to a dedicated
+ * telemetry drawer and HUD status pill, keeping the main chat stream dedicated
+ * to verified peer messages.
  */
 export class EphemeralChatView {
   /**
-   * @param {HTMLElement} logEl scrollable log container
+   * @param {HTMLElement} logEl scrollable chat log container
+   * @param {HTMLElement|null} [telemetryEl] scrollable telemetry log container
+   * @param {HTMLElement|null} [telemetryPillEl] telemetry status pill text element
    */
-  constructor(logEl) {
+  constructor(logEl, telemetryEl = null, telemetryPillEl = null) {
     this.logEl = logEl || null;
+    this.telemetryEl = telemetryEl || null;
+    this.telemetryPillEl = telemetryPillEl || null;
     /** @type {{sender:string, text:string, at:number, kind:string}[]} */
     this.volatile = []; // in-memory ONLY — dies with the tab
+    /** @type {{text:string, at:number, kind:string}[]} */
+    this.volatileTelemetry = []; // in-memory ONLY — telemetry logs
   }
 
   /**
-   * Render one message. Creates a detached node, sanitises it via
+   * Render one message. Creates detached nodes, sanitises via
    * textContent (never innerHTML), then appends and trims.
    *
    * @param {string} sender display handle
    * @param {string} text message body
-   * @param {{kind?: "peer"|"self"|"sys"}} [opts]
+   * @param {{kind?: "peer"|"self"|"sys"|"peer-plaintext"|"self-plaintext"|"telemetry"}} [opts]
    * @returns {{sender: string, text: string, at: number, kind: string}}
    */
   append(sender, text, opts = {}) {
     const kind = opts.kind || "peer";
+    const at = Date.now();
     const entry = {
-      sender: String(sender),
-      text: String(text),
-      at: Date.now(),
+      sender: String(sender || ""),
+      text: String(text || ""),
+      at,
       kind,
     };
 
-    // volatile mirror (RAM ring, capped) — never persisted
+    // Routing: Diagnostic / Signaling Logs -> Telemetry Drawer & Pill
+    if (kind === "sys" || kind === "telemetry") {
+      this.volatileTelemetry.push(entry);
+      if (this.volatileTelemetry.length > MAX_RENDERED_LINES) {
+        this.volatileTelemetry.shift();
+      }
+
+      // Update HUD status pill with current signal state
+      if (this.telemetryPillEl) {
+        this.telemetryPillEl.textContent = String(text || "").toUpperCase();
+      }
+
+      // Append to Telemetry Drawer if mounted
+      if (this.telemetryEl) {
+        const item = document.createElement("div");
+        item.className = "telemetry-entry telemetry-entry--sys";
+
+        const time = document.createElement("time");
+        time.dateTime = new Date(at).toISOString();
+        time.textContent = new Date(at).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+
+        const tag = document.createElement("span");
+        tag.className = "telemetry-tag";
+        tag.textContent =
+          text.startsWith("SECURITY") || text.includes("PANIC") || text.includes("PURGE")
+            ? "[ALERT]"
+            : text.includes("failed") || text.includes("error")
+              ? "[WARN]"
+              : "[SIGNAL]";
+
+        const body = document.createElement("span");
+        body.className = "telemetry-text";
+        body.textContent = text;
+
+        item.append(time, tag, body);
+        this.telemetryEl.appendChild(item);
+
+        while (this.telemetryEl.childElementCount > MAX_RENDERED_LINES) {
+          this.telemetryEl.removeChild(this.telemetryEl.firstChild);
+        }
+        this.telemetryEl.scrollTop = this.telemetryEl.scrollHeight;
+        return entry;
+      }
+
+      // Fallback: If no telemetry drawer or pill is present, append to main log
+      if (!this.telemetryPillEl && this.logEl) {
+        const line = document.createElement("div");
+        line.className = "chat-line chat-line--sys";
+        line.dataset.messageKind = "sys";
+        const body = document.createElement("span");
+        body.className = "chat-body";
+        body.textContent = text;
+        line.appendChild(body);
+        this.logEl.appendChild(line);
+
+        while (this.logEl.childElementCount > MAX_RENDERED_LINES) {
+          this.logEl.removeChild(this.logEl.firstChild);
+        }
+        this.logEl.scrollTop = this.logEl.scrollHeight;
+      }
+      return entry;
+    }
+
+    // Routing: Peer & Operator Chat -> Ephemeral Chat Feed
     this.volatile.push(entry);
     if (this.volatile.length > MAX_RENDERED_LINES) this.volatile.shift();
 
@@ -157,37 +235,51 @@ export class EphemeralChatView {
       line.className = `chat-line chat-line--${kind}`;
       line.dataset.messageKind = kind;
 
-      if (kind !== "sys") {
-        const meta = document.createElement("div");
-        meta.className = "chat-meta";
-        const who = document.createElement("span");
-        who.className = "chat-sender";
-        who.textContent = sender; // textContent — XSS-safe by construction
-        meta.appendChild(who);
+      const meta = document.createElement("div");
+      meta.className = "chat-meta";
 
-        const timestamp = document.createElement("time");
-        timestamp.className = "chat-time";
-        timestamp.dateTime = new Date(entry.at).toISOString();
-        timestamp.textContent = new Date(entry.at).toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-        });
-        meta.appendChild(timestamp);
-        line.appendChild(meta);
-      }
+      const who = document.createElement("span");
+      who.className = "chat-sender";
+      const isSelf = kind.startsWith("self");
+      who.textContent = isSelf
+        ? "YOU // OPERATOR"
+        : sender
+          ? `PEER // ${sender.slice(0, 8)}`
+          : "PEER";
+      meta.appendChild(who);
+
+      const timestamp = document.createElement("time");
+      timestamp.className = "chat-time";
+      timestamp.dateTime = new Date(at).toISOString();
+      timestamp.textContent = new Date(at).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      meta.appendChild(timestamp);
+
+      const securityTag = document.createElement("span");
+      const isPlaintext = kind.endsWith("-plaintext");
+      securityTag.className = `chat-security-tag ${
+        isPlaintext ? "chat-security-tag--warning" : "chat-security-tag--secure"
+      }`;
+      securityTag.textContent = isPlaintext ? "UNENCRYPTED" : "E2EE // AES-GCM";
+      securityTag.setAttribute(
+        "aria-label",
+        isPlaintext ? "Unencrypted message" : "End-to-end encrypted message",
+      );
+      meta.appendChild(securityTag);
+
+      line.appendChild(meta);
+
+      const bubble = document.createElement("div");
+      bubble.className = "chat-bubble";
 
       const body = document.createElement("span");
       body.className = "chat-body";
-      body.textContent = text; // no markup, no storage, no autocomplete feed
-      line.appendChild(body);
+      body.textContent = text; // textContent — XSS-safe by construction
+      bubble.appendChild(body);
 
-      if (kind.endsWith("-plaintext")) {
-        const securityTag = document.createElement("strong");
-        securityTag.className = "chat-security-tag";
-        securityTag.textContent = "UNENCRYPTED";
-        securityTag.setAttribute("aria-label", "This message was not end-to-end encrypted");
-        line.appendChild(securityTag);
-      }
+      line.appendChild(bubble);
 
       this.logEl.appendChild(line);
 
@@ -195,21 +287,32 @@ export class EphemeralChatView {
       while (this.logEl.childElementCount > MAX_RENDERED_LINES) {
         this.logEl.removeChild(this.logEl.firstChild);
       }
-      this.logEl.scrollTop = this.logEl.scrollHeight; // follow tail
+      this.logEl.scrollTop = this.logEl.scrollHeight;
     }
 
     return entry;
   }
 
-  /** System notice (joins, drops, warnings). */
+  /** System notice (joins, drops, warnings) routed to telemetry. */
   system(text) {
     return this.append("", text, { kind: "sys" });
   }
 
-  /** Wipe the screen AND the ring. Called on purge / panic. */
+  /** Wipe telemetry log in DOM and in-memory ring. */
+  clearTelemetry() {
+    this.volatileTelemetry.length = 0;
+    if (this.telemetryEl) this.telemetryEl.replaceChildren();
+  }
+
+  /** Wipe the screen AND the rings. Called on purge / panic. */
   flush() {
     this.volatile.length = 0;
+    this.volatileTelemetry.length = 0;
     if (this.logEl) this.logEl.replaceChildren();
+    if (this.telemetryEl) this.telemetryEl.replaceChildren();
+    if (this.telemetryPillEl) {
+      this.telemetryPillEl.textContent = "PURGED // RAM DESTROYED";
+    }
   }
 }
 

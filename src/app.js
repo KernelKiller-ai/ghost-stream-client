@@ -74,6 +74,12 @@ const els = {
   rejectKnock: $("rejectKnock"),
   pendingApproval: $("pendingApproval"),
   cancelPendingJoin: $("cancelPendingJoin"),
+  telemetryPill: $("telemetryPill"),
+  telemetryPillText: $("telemetryPillText"),
+  telemetryDrawer: $("telemetryDrawer"),
+  telemetryLog: $("telemetryLog"),
+  closeTelemetry: $("closeTelemetry"),
+  telemetryClearBtn: $("telemetryClearBtn"),
 };
 
 function updateRadar() {
@@ -180,7 +186,11 @@ function setChatControlsEnabled(enabled) {
 /* ---------------- module instances ---------------- */
 const signaling = new SignalingClient();
 const media = new MediaStreamController();
-const chat = new EphemeralChatView(els.chatLog);
+const chat = new EphemeralChatView(
+  els.chatLog,
+  els.telemetryLog,
+  els.telemetryPillText,
+);
 const radarPeers = new Map();
 let radarExpiryTimer = null;
 let roomToken = null;
@@ -312,6 +322,7 @@ rtc._handlePacket = async function (wire) {
 /* ---------------- session state ---------------- */
 let roomCode = null;
 let chatOpen = false;
+let telemetryOpen = false;
 let cryptoHandshakePromise = null;
 
 function notifyCryptoReady() {
@@ -862,6 +873,7 @@ function showPurgeOverlay() {
 function executePanic() {
   if (els.btnPanic) els.btnPanic.dataset.active = "true";
   chat.system("PANIC — destroying session");
+  toggleTelemetry(false);
   clearInviteState();
   clearKnockRequest();
   hidePendingApproval();
@@ -872,6 +884,7 @@ function executePanic() {
 function reinitializeSession() {
   els.purgeOverlay?.classList.add("hidden");
   els.btnPanic.dataset.active = "false";
+  toggleTelemetry(false);
   volatileBuffer.wipeStore();
   chat.flush();
   rtc.closePeerConnection();
@@ -920,7 +933,15 @@ document.addEventListener("keydown", (event) => {
       toggleChat();
       break;
     case "escape":
-      executePanic();
+      if (inviteModalOpen) {
+        hideInviteModal();
+      } else if (chatOpen) {
+        toggleChat();
+      } else if (telemetryOpen) {
+        toggleTelemetry(false);
+      } else {
+        executePanic();
+      }
       break;
     default:
       break;
@@ -931,6 +952,18 @@ function toggleChat() {
   chatOpen = !chatOpen;
   renderChatDrawer(els.chatDrawer, els.btnChat, els.chatState, chatOpen);
   if (chatOpen) els.chatInput?.focus();
+}
+
+function toggleTelemetry(open) {
+  telemetryOpen = typeof open === "boolean" ? open : !telemetryOpen;
+  if (els.telemetryDrawer) {
+    els.telemetryDrawer.classList.toggle("collapsed", !telemetryOpen);
+    els.telemetryDrawer.setAttribute("aria-expanded", String(telemetryOpen));
+  }
+  if (els.telemetryPill) {
+    els.telemetryPill.setAttribute("aria-expanded", String(telemetryOpen));
+    els.telemetryPill.dataset.active = String(telemetryOpen);
+  }
 }
 
 els.btnCreateRoom.addEventListener("click", () => {
@@ -985,6 +1018,18 @@ els.closeChat.addEventListener("click", () => {
   requestAnimationFrame(() => {
     renderChatDrawer(els.chatDrawer, els.btnChat, els.chatState, chatOpen);
   });
+});
+
+els.telemetryPill?.addEventListener("click", () => {
+  requestAnimationFrame(() => toggleTelemetry());
+});
+
+els.closeTelemetry?.addEventListener("click", () => {
+  requestAnimationFrame(() => toggleTelemetry(false));
+});
+
+els.telemetryClearBtn?.addEventListener("click", () => {
+  chat.clearTelemetry();
 });
 
 els.chatForm.addEventListener("submit", (event) => {

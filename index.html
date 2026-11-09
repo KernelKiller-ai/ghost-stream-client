@@ -56,6 +56,37 @@
         </div>
       </header>
 
+      <div class="telemetry-bar">
+        <button class="telemetry-pill" id="telemetryPill" type="button" aria-expanded="false" aria-controls="telemetryDrawer" aria-label="Toggle telemetry and signal log">
+          <span class="telemetry-dot" aria-hidden="true"></span>
+          <span class="telemetry-label">SIGNAL:</span>
+          <span class="telemetry-text" id="telemetryPillText">STANDBY // AWAITING LINK</span>
+          <span class="telemetry-chevron" aria-hidden="true">▾</span>
+        </button>
+      </div>
+
+      <aside class="telemetry-drawer collapsed" id="telemetryDrawer" aria-label="Signal Telemetry Log" aria-expanded="false">
+        <div class="telemetry-head">
+          <div class="telemetry-heading">
+            <span class="eyebrow">DIAGNOSTIC LOG</span>
+            <span class="telemetry-head-title">SIGNAL &amp; PEER TELEMETRY</span>
+          </div>
+          <div class="telemetry-actions">
+            <button class="button button-subtle" id="telemetryClearBtn" type="button">CLEAR</button>
+            <button class="icon-button close-telemetry" id="closeTelemetry" type="button" aria-label="Close telemetry log">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>
+            </button>
+          </div>
+        </div>
+        <div class="telemetry-log" id="telemetryLog" aria-live="polite" role="log">
+          <div class="telemetry-entry telemetry-entry--sys">
+            <time>00:00:00</time>
+            <span class="telemetry-tag">[INIT]</span>
+            <span class="telemetry-text">GHOST-STREAM tactical uplink initialized</span>
+          </div>
+        </div>
+      </aside>
+
       <main class="stage">
         <section class="video-primary" aria-label="Remote video stream">
           <video id="videoRemote" autoplay playsinline></video>
