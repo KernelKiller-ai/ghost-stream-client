@@ -53,6 +53,10 @@ export class MediaStreamController {
   async acquire() {
     await this._ensureHttpsContext();
 
+    // Yield to the event loop so any pending UI rendering/paints take place
+    // before the browser triggers hardware media acquisition.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
     for (const constraints of FALLBACK_LADDER) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -68,8 +72,15 @@ export class MediaStreamController {
         return { stream, mode: this.mode, error: null };
       } catch (err) {
         this.lastError = err;
-        // PermissionDenied / NotFound are terminal for this rung; keep
-        // descending. SecurityError / aborts also just fall through.
+        // If permission was denied for video+audio, do not repeatedly re-request
+        // redundant full constraints that will synchronously block or prompt again.
+        if (err.name === "NotAllowedError" || err.name === "SecurityError") {
+          if (constraints.video && constraints.audio) {
+            // Skip simplest full attempt and jump directly to audio-only
+            continue;
+          }
+          break; // Permission definitively denied by user
+        }
         continue;
       }
     }

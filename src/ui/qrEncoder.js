@@ -194,15 +194,48 @@ export function renderQrCode(svg, payload) {
   background.setAttribute("fill", "#ffffff");
   svg.appendChild(background);
 
-  let pathData = "";
-  matrix.forEach((row, y) => {
-    row.forEach((dark, x) => {
-      if (dark) pathData += `M${x + quietZone},${y + quietZone}h1v1h-1z`;
-    });
-  });
+  const paths = [];
+  const len = matrix.length;
+  for (let y = 0; y < len; y++) {
+    const row = matrix[y];
+    for (let x = 0; x < len; x++) {
+      if (row[x]) paths.push(`M${x + quietZone},${y + quietZone}h1v1h-1z`);
+    }
+  }
   const modules = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  modules.setAttribute("d", pathData);
+  modules.setAttribute("d", paths.join(""));
   modules.setAttribute("fill", "#06100c");
   svg.appendChild(modules);
   return true;
+}
+
+/**
+ * Asynchronous wrapper around renderQrCode.
+ * Yields to the browser event loop before computation to prevent UI freezes.
+ * @param {SVGSVGElement|null} svg
+ * @param {string} payload
+ * @returns {Promise<boolean>}
+ */
+export function renderQrCodeAsync(svg, payload) {
+  return new Promise((resolve, reject) => {
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => {
+        setTimeout(() => {
+          try {
+            resolve(renderQrCode(svg, payload));
+          } catch (err) {
+            reject(err);
+          }
+        }, 0);
+      });
+    } else {
+      setTimeout(() => {
+        try {
+          resolve(renderQrCode(svg, payload));
+        } catch (err) {
+          reject(err);
+        }
+      }, 0);
+    }
+  });
 }

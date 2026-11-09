@@ -231,9 +231,13 @@ export async function openPacket(wire) {
 
 /* ---------------- base64url helpers ---------------- */
 
+const CHUNK_SIZE = 0x8000;
+
 function toB64url(bytes) {
   let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK_SIZE));
+  }
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 

@@ -213,6 +213,17 @@ export async function destroySession() {
     }
   }
 
+  /* (c) Wipe the message store and nullify references synchronously in RAM. */
+  try {
+    _wipeStore();
+  } catch {
+    /* wipe must never be skipped */
+  }
+  _wipeStore = () => {};
+  _hooks.onTick = null;
+  _hooks.onPurgeStart = null;
+  _deadlineMs = 0;
+
   try {
     const teardownResult = _teardownHandler?.();
     if (teardownResult && typeof teardownResult.then === "function") {
@@ -221,17 +232,6 @@ export async function destroySession() {
   } catch (error) {
     console.error("[AutoPurge] Custom teardown handler failed:", error);
   }
-
-  /* (c) Wipe the message store and nullify every reference. */
-  try {
-    _wipeStore();
-  } catch {
-    /* wipe must never be skipped, but never throws past us */
-  }
-  _wipeStore = () => {};
-  _hooks.onTick = null;
-  _hooks.onPurgeStart = null;
-  _deadlineMs = 0;
 
   try {
     _hooks.onPurgeComplete?.();

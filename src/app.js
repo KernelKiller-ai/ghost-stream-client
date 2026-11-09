@@ -334,15 +334,19 @@ function showInviteModal() {
   }
   els.inviteModal?.classList.remove("hidden");
   els.inviteModal?.setAttribute("aria-hidden", "false");
-  try {
-    refreshInviteToken();
-  } catch (error) {
-    chat.system(`QR invite unavailable: ${error.message}`);
-    els.inviteStatus.textContent = "INVITE ENCODING FAILED";
-    return;
-  }
-  if (inviteCountdownTimer !== null) clearInterval(inviteCountdownTimer);
-  inviteCountdownTimer = setInterval(updateInviteCountdown, 250);
+  if (els.inviteStatus) els.inviteStatus.textContent = "GENERATING SECURE QR...";
+
+  setTimeout(() => {
+    try {
+      refreshInviteToken();
+    } catch (error) {
+      chat.system(`QR invite unavailable: ${error.message}`);
+      if (els.inviteStatus) els.inviteStatus.textContent = "INVITE ENCODING FAILED";
+      return;
+    }
+    if (inviteCountdownTimer !== null) clearInterval(inviteCountdownTimer);
+    inviteCountdownTimer = setInterval(updateInviteCountdown, 250);
+  }, 0);
 }
 
 function refreshInviteToken() {
@@ -391,7 +395,13 @@ function drawInviteQr() {
   const payload =
     `${window.location.origin}/#join=${encodeURIComponent(roomCode)}` +
     `&token=${encodeURIComponent(roomToken)}`;
-  renderQrCode(els.inviteQr, payload);
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => {
+      renderQrCode(els.inviteQr, payload);
+    });
+  } else {
+    renderQrCode(els.inviteQr, payload);
+  }
 }
 
 function updateInviteCountdown() {
@@ -514,17 +524,21 @@ async function handleCreateRoom() {
     hostJoined = false;
     renderRoomCode(els.roomCode, roomCode);
     chat.system(`room ${roomCode} created — link valid 2 hours`);
+    setStatus("CONNECTING...", "pending");
 
     await connectAndArm(roomCode, { token: roomToken, isHost: true });
 
     // As initiator we create the peer connection + data channel now,
     // and fire the offer the moment the peer joins.
+    setStatus("ACQUIRING MEDIA...", "pending");
     await setupLocalMedia();
     startNativeProximityScan();
     rtc.createPeerConnection(media.stream, { initiator: true });
     chat.system("awaiting peer — offer queued");
+    setStatus("AWAITING LINK", "idle");
   } catch (err) {
     chat.system(`create failed: ${err.message}`);
+    setStatus("AWAITING LINK", "idle");
   }
 }
 
@@ -919,43 +933,92 @@ function toggleChat() {
   if (chatOpen) els.chatInput?.focus();
 }
 
-els.btnCreateRoom.addEventListener("click", handleCreateRoom);
-els.btnJoinRoom.addEventListener("click", () => handleJoinRoom());
-els.btnQr.addEventListener("click", showInviteModal);
-els.closeInvite.addEventListener("click", hideInviteModal);
-els.approveKnock.addEventListener("click", authorizePendingKnock);
-els.rejectKnock.addEventListener("click", rejectPendingKnock);
-els.cancelPendingJoin.addEventListener("click", cancelPendingJoin);
-els.copyRoom.addEventListener("click", async () => {
+els.btnCreateRoom.addEventListener("click", () => {
+  if (els.btnCreateRoom) els.btnCreateRoom.disabled = true;
+  setTimeout(() => {
+    handleCreateRoom().finally(() => {
+      if (els.btnCreateRoom && !signaling.isConnected) {
+        els.btnCreateRoom.disabled = false;
+      }
+    });
+  }, 0);
+});
+
+els.btnJoinRoom.addEventListener("click", () => {
+  setTimeout(() => handleJoinRoom(), 0);
+});
+
+els.btnQr.addEventListener("click", () => {
+  setTimeout(showInviteModal, 0);
+});
+
+els.closeInvite.addEventListener("click", () => {
+  requestAnimationFrame(hideInviteModal);
+});
+
+els.approveKnock.addEventListener("click", () => {
+  setTimeout(authorizePendingKnock, 0);
+});
+
+els.rejectKnock.addEventListener("click", () => {
+  setTimeout(rejectPendingKnock, 0);
+});
+
+els.cancelPendingJoin.addEventListener("click", () => {
+  setTimeout(cancelPendingJoin, 0);
+});
+
+els.copyRoom.addEventListener("click", () => {
   if (!roomCode) {
     chat.system("create or join a room before copying its code");
     return;
   }
-  try {
-    await navigator.clipboard.writeText(roomCode);
+  navigator.clipboard.writeText(roomCode).then(() => {
     chat.system("room code copied");
-  } catch (error) {
+  }).catch((error) => {
     chat.system(`could not copy room code: ${error.message}`);
-  }
+  });
 });
+
 els.closeChat.addEventListener("click", () => {
   chatOpen = false;
-  renderChatDrawer(els.chatDrawer, els.btnChat, els.chatState, chatOpen);
+  requestAnimationFrame(() => {
+    renderChatDrawer(els.chatDrawer, els.btnChat, els.chatState, chatOpen);
+  });
 });
 
 els.chatForm.addEventListener("submit", (event) => {
   event.preventDefault(); // no page reload, no history entry
   const value = els.chatInput.value;
   els.chatInput.value = ""; // input holds nothing after send
-  handleSendMessage(value);
+  if (value.trim()) {
+    setTimeout(() => handleSendMessage(value), 0);
+  }
 });
 
-els.btnAudio.addEventListener("click", () => handleToggleMedia("audio"));
-els.btnVideo.addEventListener("click", () => handleToggleMedia("video"));
-els.btnChat.addEventListener("click", toggleChat);
-els.btnNuke.addEventListener("click", executePanic);
-els.btnPanic.addEventListener("click", executePanic);
-els.btnRecover.addEventListener("click", reinitializeSession);
+els.btnAudio.addEventListener("click", () => {
+  requestAnimationFrame(() => handleToggleMedia("audio"));
+});
+
+els.btnVideo.addEventListener("click", () => {
+  requestAnimationFrame(() => handleToggleMedia("video"));
+});
+
+els.btnChat.addEventListener("click", () => {
+  requestAnimationFrame(toggleChat);
+});
+
+els.btnNuke.addEventListener("click", () => {
+  executePanic();
+});
+
+els.btnPanic.addEventListener("click", () => {
+  executePanic();
+});
+
+els.btnRecover.addEventListener("click", () => {
+  setTimeout(reinitializeSession, 0);
+});
 setChatControlsEnabled(false);
 radarExpiryTimer = setInterval(expireNativeRadarPeers, 5000);
 updateRadar();

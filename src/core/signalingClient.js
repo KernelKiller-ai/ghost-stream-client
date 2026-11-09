@@ -28,7 +28,7 @@
  * Fallback connects to local backend or dedicated Render signaling server with root path.
  */
 export const SIGNALING_URL =
-  (typeof import.meta !== "undefined" && import.meta.env?.VITE_SIGNALING_URL) ||
+  import.meta.env?.VITE_SIGNALING_URL ||
   ((typeof window !== "undefined" ? window.location.hostname : "localhost") === "localhost"
     ? "ws://localhost:10000"
     : "wss://ghost-stream-backend.onrender.com");
