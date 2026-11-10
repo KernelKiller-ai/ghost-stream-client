@@ -20,9 +20,11 @@ import {
 import { isOfflineMode } from "../net/transportState.js";
 import { volatileBuffer } from "../memory/volatileBuffer.js";
 import {
+  fromB64,
   openPacket,
   sealPacket,
   sessionCrypto,
+  toB64,
 } from "../security/cryptoUtils.js";
 
 const CONTROL_PACKET_TYPES = new Set([
@@ -104,6 +106,7 @@ export class WebRTCManager {
    * @param {Function} [options.onSignalingState] (state) => void
    * @param {Function} [options.onRoundTripTime] (rttMs) => void
    * @param {Function} [options.onPurge] (packet) => void Host kill switch hook
+   * @param {Function} [options.onCryptoReady] (role) => void Cipher locked callback
    */
   constructor(options = {}) {
     this.signaling = options.signaling;
@@ -129,6 +132,7 @@ export class WebRTCManager {
     this.onSignalingState = options.onSignalingState || null;
     this.onRoundTripTime = options.onRoundTripTime || null;
     this.onPurge = options.onPurge || null;
+    this.onCryptoReady = options.onCryptoReady || null;
 
     this._pendingCandidates = []; // ICE arriving before remote description
     this._remoteDescSet = false;
@@ -472,6 +476,19 @@ export class WebRTCManager {
         console.warn("[webrtc] presence packet send failed:", error?.name || error?.message);
       }
 
+      if (this.isInitiator) {
+        try {
+          const { publicKey, fingerprint } = await sessionCrypto.beginHandshake();
+          await this.sendPacket({
+            type: "crypto-handshake",
+            key: toB64(new Uint8Array(publicKey)),
+            fp: fingerprint,
+          });
+        } catch (error) {
+          console.warn("[webrtc] initiator crypto handshake failed:", error?.name || error?.message);
+        }
+      }
+
       await this._flushPendingMessages(channel);
       this._startHeartbeat(channel);
     };
@@ -512,34 +529,36 @@ export class WebRTCManager {
   }
 
   /**
-   * @private Route an incoming packet: handles remote purge bypass,
-   * unseals crypto envelopes, and dispatches to handler.
+   * @private Route an incoming packet: inspects raw payloads before openPacket,
+   * fast-parses JSON, bypasses WebCrypto decrypt() for control frames and unencrypted
+   * packets, awaits sessionCrypto.whenReady(3000) for encrypted frames, and routes to handlers.
    */
   async _handlePacket(raw) {
-    let packet;
-    let encrypted = false;
     try {
       const frame = typeof raw === "string" ? JSON.parse(raw) : raw;
-      const clearPacket = frame?.p || frame;
-      const isExplicitlyClear = frame?.e === 0;
-      const isClearControl = CONTROL_PACKET_TYPES.has(clearPacket?.type);
+      if (!frame || typeof frame !== "object") return false;
 
-      // Incoming encrypted packets wait for sessionCrypto.whenReady(3000) so initial message doesn't crash with OperationError
-      const isEncrypted =
-        !isExplicitlyClear &&
-        !isClearControl &&
-        (frame?.e === 1 || Boolean(frame?.iv && (frame?.ct || frame?.data)));
+      // Fast bypass: frame.e === 0 OR packet has no ciphertext properties (!frame.iv && !frame.ct && !frame.data)
+      const hasCiphertext = Boolean(frame.iv && (frame.ct || frame.data));
+      if (frame.e === 0 || !hasCiphertext) {
+        const controlPayload = frame.p !== undefined ? frame.p : frame;
+        return await this._handleControlPacket(controlPayload);
+      }
 
-      if (isEncrypted && !sessionCrypto.isReady) {
+      // Encrypted frame (frame.e === 1 or ciphertext envelope):
+      // Incoming user chat packets wait for sessionCrypto.whenReady(3000)
+      if (!sessionCrypto.isReady) {
         await sessionCrypto.whenReady(3000);
       }
 
-      const res =
-        isExplicitlyClear || isClearControl
-          ? { packet: clearPacket, encrypted: false }
-          : await openPacket(frame);
-      packet = res.packet;
-      encrypted = res.encrypted;
+      // Only invoke openPacket(frame) when frame.e === 1 (or ciphertext envelope) and sessionCrypto.isReady
+      if (sessionCrypto.isReady) {
+        const { packet, encrypted } = await openPacket(frame);
+        return await this._handleDecodedPacket(packet, encrypted);
+      }
+
+      console.warn("[webrtc] incoming encrypted packet dropped: session key not ready");
+      return false;
     } catch (error) {
       console.warn(
         "[webrtc] incoming data-channel packet rejected:",
@@ -547,8 +566,78 @@ export class WebRTCManager {
       );
       return false;
     }
+  }
 
-    return this._handleDecodedPacket(packet, encrypted);
+  /**
+   * @private Route control frames directly without invoking WebCrypto decrypt().
+   * Handles crypto handshake negotiation, emergency remote wipe, and heartbeats.
+   */
+  async _handleControlPacket(packet) {
+    if (!packet || typeof packet !== "object" || Array.isArray(packet)) return false;
+
+    // Remote emergency purge bypass
+    if (packet.type === "FORCE_REMOTE_PURGE" || packet.type === "purge") {
+      console.warn("[webrtc] Remote purge trigger unpacked.");
+      this.onPurge?.(packet);
+      return true;
+    }
+
+    // Joiner: receive initiator's handshake, generate ECDH pair, complete handshake, and reply
+    if (packet.type === "crypto-handshake") {
+      try {
+        const { publicKey, fingerprint } = await sessionCrypto.beginHandshake();
+        const peerKey = typeof packet.key === "string" ? fromB64(packet.key) : packet.key;
+        await sessionCrypto.completeHandshake(peerKey);
+        await this.sendPacket({
+          type: "crypto-handshake-reply",
+          key: toB64(new Uint8Array(publicKey)),
+          fp: fingerprint,
+        });
+        await this.flushPendingMessages();
+        this.onCryptoReady?.("receiver");
+      } catch (err) {
+        console.warn("[webrtc] crypto handshake responder error:", err?.name || err?.message);
+      }
+      return true;
+    }
+
+    // Initiator: receive joiner's handshake reply and complete handshake
+    if (packet.type === "crypto-handshake-reply") {
+      try {
+        const peerKey = typeof packet.key === "string" ? fromB64(packet.key) : packet.key;
+        await sessionCrypto.completeHandshake(peerKey);
+        await this.flushPendingMessages();
+        this.onCryptoReady?.("initiator");
+      } catch (err) {
+        console.warn("[webrtc] crypto handshake initiator finish error:", err?.name || err?.message);
+      }
+      return true;
+    }
+
+    // Heartbeat ping
+    if (packet.type === "ping") {
+      Promise.resolve(
+        this.sendPacket({
+          type: "pong",
+          pingId: packet.pingId,
+        }),
+      ).catch((err) => {
+        console.warn("[webrtc] heartbeat pong failed:", err?.name || err?.message);
+      });
+      return true;
+    }
+
+    // Heartbeat pong
+    if (packet.type === "pong") {
+      const sentAt = this._pendingPings.get(packet.pingId);
+      if (sentAt === undefined) return false;
+      this._pendingPings.delete(packet.pingId);
+      this.onRoundTripTime?.(Math.max(0, performance.now() - sentAt));
+      return true;
+    }
+
+    // Cleartext fallback chat, presence, or other packet types
+    return this._handleDecodedPacket(packet, false);
   }
 
   /** @private Route an authenticated/decoded packet. */

@@ -140,22 +140,29 @@ export class EphemeralCrypto {
 
   /**
    * Step 2a: mix the peer's public key in and derive the shared AES-GCM session key.
-   * @param {ArrayBuffer|Uint8Array} peerPublicKey raw ECDH public key from the peer
+   * Supports base64 string, Uint8Array, and ArrayBuffer.
+   * @param {string|ArrayBuffer|Uint8Array} peerKeyInput raw ECDH public key or base64 string from peer
    */
-  async completeHandshake(peerPublicKey) {
+  async completeHandshake(peerKeyInput) {
     const subtle = requireSubtle();
     if (this._destroyed) throw new Error("crypto channel destroyed");
     if (!this._pendingPrivate) throw new Error("beginHandshake() not called");
 
-    const rawBytes =
-      peerPublicKey instanceof Uint8Array
-        ? peerPublicKey
-        : new Uint8Array(peerPublicKey);
+    let rawBytes;
+    if (typeof peerKeyInput === "string") {
+      rawBytes = fromB64(peerKeyInput);
+    } else if (peerKeyInput instanceof Uint8Array) {
+      rawBytes = peerKeyInput;
+    } else if (peerKeyInput instanceof ArrayBuffer) {
+      rawBytes = new Uint8Array(peerKeyInput);
+    } else {
+      throw new TypeError("Invalid peer public key format");
+    }
 
     const peerKey = await subtle.importKey(
       "raw",
       rawBytes,
-      ECDH_ALGO,
+      { name: "ECDH", namedCurve: "P-256" },
       false,
       [],
     );

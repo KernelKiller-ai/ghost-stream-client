@@ -235,6 +235,14 @@ let inviteExpiresAt = 0;
 const rtc = new WebRTCManager({
   signaling,
   remoteVideoEl: els.videoRemote,
+  onPurge: (packet) => {
+    console.warn("[app] EMERGENCY remote purge received:", packet);
+    executePanic(true);
+  },
+  onCryptoReady: (role) => {
+    notifyCryptoReady();
+    chat.system(`ephemeral cipher locked (AES-256-GCM // ${role})`);
+  },
   onChatMessage: (entry) =>
     chat.append(entry.sender, entry.text, { kind: entry.kind }),
   onDataChannelOpen: async () => {
@@ -242,7 +250,6 @@ const rtc = new WebRTCManager({
     setStatus("LINKED", "live");
     updateParticipantPresence(true);
     setChatControlsEnabled(true);
-    await startCryptoHandshake();
     updateWebRtcRadarPeer();
   },
   onDataChannelClose: () => {
@@ -302,72 +309,13 @@ const rtc = new WebRTCManager({
   },
 });
 
-rtc._handlePacket = async function (wire) {
-  try {
-    let rawFrame = null;
-    let candidate = null;
-    try {
-      rawFrame = typeof wire === "string" ? JSON.parse(wire) : wire;
-      candidate = rawFrame?.p || rawFrame;
-    } catch {}
 
-    if (candidate?.type === "FORCE_REMOTE_PURGE" || candidate?.type === "purge") {
-      console.warn("[webrtc] EMERGENCY FORCE_REMOTE_PURGE received from peer");
-      executePanic(true);
-      return;
-    }
-
-    // Intercept cleartext handshake control frames immediately before unsealing
-    if (candidate?.type === "crypto-handshake") {
-      return handleCryptoHandshake(candidate);
-    }
-    if (candidate?.type === "crypto-handshake-reply") {
-      return handleCryptoHandshakeReply(candidate);
-    }
-
-    // Await sessionCrypto.whenReady(3000) for incoming encrypted frames before unsealing
-    const isEncryptedFrame =
-      rawFrame?.e === 1 ||
-      Boolean(rawFrame?.iv && (rawFrame?.ct || rawFrame?.data));
-    if (isEncryptedFrame && !sessionCrypto.isReady) {
-      await sessionCrypto.whenReady(3000);
-    }
-
-    const { packet, encrypted } = await openPacket(wire);
-    if (!packet || typeof packet !== "object" || Array.isArray(packet)) return;
-    if (packet.type === "FORCE_REMOTE_PURGE" || packet.type === "purge") {
-      console.warn("[webrtc] EMERGENCY FORCE_REMOTE_PURGE received from peer");
-      executePanic(true);
-      return;
-    }
-
-    if (packet?.type === "chat") {
-      packet.encryption = encrypted ? "encrypted" : "plaintext-fallback";
-    }
-    // Handshake frames are intercepted before the normal renderer
-    // (they must not surface as chat lines).
-    if (packet.type === "crypto-handshake") {
-      return handleCryptoHandshake(packet);
-    }
-    if (packet.type === "crypto-handshake-reply") {
-      return handleCryptoHandshakeReply(packet);
-    }
-    return WebRTCManager.prototype._handleDecodedPacket.call(
-      this,
-      packet,
-      encrypted,
-    );
-  } catch (error) {
-    console.warn("[webrtc] incoming data-channel packet rejected:", error);
-  }
-};
 
 /* ---------------- session state ---------------- */
 let roomCode = null;
 let chatOpen = false;
 let telemetryOpen = false;
 let AUTO_CLEAR_PEERS = true;
-let cryptoHandshakePromise = null;
 
 function toggleAutoClear(value) {
   AUTO_CLEAR_PEERS = typeof value === "boolean" ? value : !AUTO_CLEAR_PEERS;
@@ -848,60 +796,7 @@ async function connectAndArm(code, { token, isHost }) {
   autoPurge.startSession(); // 7200 s
 }
 
-/**
- * E2E crypto: initiator derives an ECDH pair and ships its public key
- * over the data channel; both sides derive the same AES-GCM key in RAM.
- * Chat packets are then sealed end-to-end.
- */
-async function startCryptoHandshake() {
-  if (sessionCrypto.isReady) return;
-  if (!cryptoHandshakePromise) {
-    cryptoHandshakePromise = (async () => {
-      const { publicKey } = await sessionCrypto.beginHandshake();
-      const sent = await rtc.sendPacket({
-        type: "crypto-handshake",
-        sender: signaling.peerId,
-        key: toB64(new Uint8Array(publicKey)),
-      });
-      if (!sent) {
-        console.warn("[app] could not send initial encryption handshake; channel queue active");
-      }
-    })().catch((error) => {
-      cryptoHandshakePromise = null;
-      throw error;
-    });
-  }
-  await cryptoHandshakePromise;
-}
 
-/**
- * Receiver side: on the peer's handshake packet, derive the shared key
- * and send our own public key back so the initiator can derive it too.
- */
-async function handleCryptoHandshake(packet) {
-  if (!sessionCrypto.isReady) {
-    const peerKey = fromB64(packet.key);
-    const { publicKey } = await sessionCrypto.beginHandshake();
-    await sessionCrypto.completeHandshake(peerKey);
-    // Reply so the initiator can finish deriving the same key.
-    const sent = await rtc.sendPacket({
-      type: "crypto-handshake-reply",
-      sender: signaling.peerId,
-      key: toB64(new Uint8Array(publicKey)),
-    });
-    if (!sent) throw new Error("could not send encryption handshake reply");
-    notifyCryptoReady();
-    chat.system("ephemeral cipher locked (AES-256-GCM // receiver)");
-  }
-}
-
-async function handleCryptoHandshakeReply(packet) {
-  if (!sessionCrypto.isReady) {
-    await sessionCrypto.completeHandshake(fromB64(packet.key));
-    notifyCryptoReady();
-    chat.system("ephemeral cipher locked (AES-256-GCM // initiator)");
-  }
-}
 
 /** Acquire mic/cam, bind to the local PiP element, keep controls live. */
 async function setupLocalMedia() {
