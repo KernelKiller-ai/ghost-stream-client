@@ -80,6 +80,7 @@ const els = {
   telemetryLog: $("telemetryLog"),
   closeTelemetry: $("closeTelemetry"),
   telemetryClearBtn: $("telemetryClearBtn"),
+  btnAutoClear: $("btnAutoClear"),
 };
 
 function updateRadar() {
@@ -212,8 +213,7 @@ const rtc = new WebRTCManager({
     chat.system("ephemeral channel open — serverless relay active");
     setStatus("LINKED", "live");
     setChatControlsEnabled(true);
-    // The offerer starts key agreement; the answerer replies to its frame.
-    if (rtc.isInitiator) await startCryptoHandshake();
+    await startCryptoHandshake();
     updateWebRtcRadarPeer();
   },
   onDataChannelClose: () => {
@@ -223,17 +223,51 @@ const rtc = new WebRTCManager({
     removeWebRtcRadarPeer();
   },
   onRoundTripTime: (rttMs) => updateWebRtcRadarPeer(rttMs),
+  onIceConnectionState: (state) => {
+    console.info(`[app] WebRTC iceConnectionState: ${state}`);
+    if (state === "checking") {
+      chat.system("ICE candidate checking — discovering STUN/TURN relays");
+      if (els.telemetryPillText) els.telemetryPillText.textContent = "ICE // CHECKING RELAYS";
+    } else if (state === "connected" || state === "completed") {
+      chat.system(`ICE path established (${state}) — direct relay active`);
+      if (els.telemetryPillText) els.telemetryPillText.textContent = "ICE // CONNECTED (P2P/TURN)";
+      renderRemoteState(els.remoteFallback, rtc.remoteStream, "connected");
+    } else if (state === "failed") {
+      chat.system("ICE negotiation failed across network NATs — checking fallback");
+      if (els.telemetryPillText) els.telemetryPillText.textContent = "ICE // NAT TRAVERSAL FAILED";
+      setStatus("ICE FAILED", "warning");
+    } else if (state === "disconnected") {
+      chat.system("ICE disconnected — network switch or temporary packet loss");
+      if (els.telemetryPillText) els.telemetryPillText.textContent = "ICE // DISCONNECTED";
+    }
+  },
+  onSignalingState: (state) => {
+    console.info(`[app] WebRTC signalingState: ${state}`);
+    if (state === "have-remote-offer") {
+      chat.system("SDP remote offer received — generating answer");
+      if (els.telemetryPillText) els.telemetryPillText.textContent = "WEBRTC // ANSWERING OFFER";
+    }
+  },
   onConnectionState: (state) => {
+    console.info(`[app] WebRTC connectionState: ${state}`);
     if (state === "connected") {
       setStatus(
         rtc.dataChannel?.readyState === "open" ? "LINKED" : "STREAM ACTIVE",
         "live",
       );
+      if (els.telemetryPillText) els.telemetryPillText.textContent = "LINK ACTIVE // ENCRYPTED";
       els.remoteFallback.classList.add("hidden");
       document.querySelector(".video-primary")?.classList.add("has-remote");
+      renderRemoteState(els.remoteFallback, rtc.remoteStream, "connected");
+    } else if (state === "connecting") {
+      setStatus("HANDSHAKE...", "pending");
+      if (els.telemetryPillText) els.telemetryPillText.textContent = "WEBRTC // HANDSHAKE";
     } else if (state === "failed" || state === "disconnected") {
       setStatus("LINK UNSTABLE", "warning");
+      if (els.telemetryPillText) els.telemetryPillText.textContent = `WEBRTC // ${state.toUpperCase()}`;
       setChatControlsEnabled(false);
+      renderRemoteState(els.remoteFallback, rtc.remoteStream, state);
+      chat.system(`WebRTC peer connection state dropped to '${state}'`);
     }
   },
 });
@@ -323,7 +357,19 @@ rtc._handlePacket = async function (wire) {
 let roomCode = null;
 let chatOpen = false;
 let telemetryOpen = false;
+let AUTO_CLEAR_PEERS = true;
 let cryptoHandshakePromise = null;
+
+function toggleAutoClear(value) {
+  AUTO_CLEAR_PEERS = typeof value === "boolean" ? value : !AUTO_CLEAR_PEERS;
+  if (els.btnAutoClear) {
+    els.btnAutoClear.dataset.active = String(AUTO_CLEAR_PEERS);
+    els.btnAutoClear.setAttribute("aria-pressed", String(AUTO_CLEAR_PEERS));
+    els.btnAutoClear.textContent = AUTO_CLEAR_PEERS ? "AUTO: ON" : "AUTO: OFF";
+  }
+  window.AUTO_CLEAR_PEERS = AUTO_CLEAR_PEERS;
+  chat.system(`tactical setting: AUTO_CLEAR_PEERS is now ${AUTO_CLEAR_PEERS ? "ENABLED" : "DISABLED"}`);
+}
 
 function notifyCryptoReady() {
   if (!sessionCrypto.isReady) return;
@@ -441,10 +487,12 @@ function clearInviteState() {
   if (els.btnQr) els.btnQr.disabled = true;
 }
 
-function showKnockRequest({ peerId, timestamp }) {
+function showKnockRequest({ peerId, timestamp, codeOnly = false }) {
   pendingKnockPeer = peerId;
-  pendingKnockExpiresAt = timestamp + 30_000;
-  els.knockPeer.textContent = short(peerId);
+  pendingKnockExpiresAt = (timestamp || Date.now()) + 30_000;
+  if (els.knockPeer) {
+    els.knockPeer.textContent = `${short(peerId)}${codeOnly ? " [CODE ENTRY]" : " [QR INVITE]"}`;
+  }
   els.knockModal?.classList.remove("hidden");
   els.knockModal?.setAttribute("aria-hidden", "false");
   updateKnockCountdown();
@@ -488,6 +536,13 @@ function authorizePendingKnock() {
     return;
   }
   clearKnockRequest();
+  rtc.remotePeerId = peerId;
+  if (rtc.isInitiator && rtc.pc) {
+    rtc
+      .createOffer()
+      .then(() => chat.system("WebRTC SDP offer transmitted to peer"))
+      .catch((err) => chat.system(`offer failed: ${err.message}`));
+  }
 }
 
 function rejectPendingKnock() {
@@ -553,36 +608,68 @@ async function handleCreateRoom() {
   }
 }
 
-/** JOIN ROOM — connect signaling to an existing room, receive the offer. */
+/** JOIN ROOM — connect signaling to an existing room by code or full invite URL. */
 async function handleJoinRoom(inputInvite, inputToken) {
+  let raw = inputInvite;
+  if (!raw && !inputToken) {
+    raw = window.prompt("Enter Room Code (e.g. 123456) or paste Host QR Invite URL:");
+  }
+  if (!raw && !inputToken) return;
+
   let invite =
-    inputToken && inputInvite
-      ? { roomId: inputInvite, token: inputToken }
-      : parseInvite(inputInvite || window.prompt("Scan or paste the host's current QR invite URL") || "");
-  if (!invite) {
-    chat.system("join requires a current host QR invite URL; room codes alone are not authorization");
+    inputToken && raw
+      ? { roomId: String(raw).trim().toUpperCase(), token: inputToken, isCodeOnly: false }
+      : parseInvite(raw);
+
+  if (!invite || !invite.roomId) {
+    chat.system("invalid room code or invite URL; provide a valid room code or scan host QR");
     return;
   }
-  const { roomId: code, token } = invite;
-  if (
-    !/^[A-Za-z0-9_-]{1,64}$/.test(code) ||
-    !/^[A-Za-z0-9_-]{43}$/.test(token)
-  ) {
-    chat.system("invite is malformed or expired; scan the host's current QR code");
+
+  const { roomId: code, token, isCodeOnly } = invite;
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) {
+    chat.system("room code contains invalid characters");
     return;
   }
+  if (token && !/^[A-Za-z0-9_-]{1,64}$/.test(token)) {
+    chat.system("invite token is malformed");
+    return;
+  }
+
   try {
     roomCode = code;
-    roomToken = token;
+    roomToken = token || null;
     roomIsHost = false;
     hostJoined = false;
     renderRoomCode(els.roomCode, code);
-    chat.system(`joining room ${code}…`);
 
-    await connectAndArm(code, { token, isHost: false });
-    chat.system("invite accepted — waiting for host clearance; media is not acquired yet");
+    if (isCodeOnly || !token) {
+      chat.system(`querying room ${code} via direct code entry…`);
+      setStatus("QUERYING ROOM...", "pending");
+    } else {
+      chat.system(`joining room ${code} via cryptographic invite…`);
+      setStatus("JOINING ROOM...", "pending");
+    }
+
+    await connectAndArm(code, { token: roomToken, isHost: false });
+    showPendingApproval();
+    chat.system("awaiting host clearance & WebRTC negotiation…");
+
+    // Pre-acquire camera/mic in background so media is immediately ready when offer arrives
+    setupLocalMedia()
+      .then((res) => {
+        const stream = res?.stream || media.stream;
+        if (!rtc.pc) {
+          rtc.createPeerConnection(stream, { initiator: false });
+        } else if (stream) {
+          rtc.attachLocalStream(stream);
+        }
+      })
+      .catch((err) => console.warn("[app] pre-join media warning:", err));
   } catch (err) {
     chat.system(`join failed: ${err.message}`);
+    setStatus("AWAITING LINK", "idle");
+    hidePendingApproval();
   }
 }
 
@@ -703,7 +790,9 @@ async function startCryptoHandshake() {
         sender: signaling.peerId,
         key: toB64(publicKey),
       });
-      if (!sent) throw new Error("could not send encryption handshake");
+      if (!sent) {
+        console.warn("[app] could not send initial encryption handshake; channel queue active");
+      }
     })().catch((error) => {
       cryptoHandshakePromise = null;
       throw error;
@@ -735,7 +824,7 @@ async function handleCryptoHandshake(packet) {
     });
     if (!sent) throw new Error("could not send encryption handshake reply");
     notifyCryptoReady();
-    chat.system("ephemeral cipher locked (receiver)");
+    chat.system("ephemeral cipher locked (AES-256-GCM // receiver)");
   }
 }
 
@@ -743,7 +832,7 @@ async function handleCryptoHandshakeReply(packet) {
   if (!sessionCrypto.isReady) {
     await sessionCrypto.completeHandshake(fromB64(packet.key));
     notifyCryptoReady();
-    chat.system("ephemeral cipher locked (initiator)");
+    chat.system("ephemeral cipher locked (AES-256-GCM // initiator)");
   }
 }
 
@@ -754,6 +843,8 @@ async function setupLocalMedia() {
   if (result.stream) {
     els.videoLocal.srcObject = result.stream;
     els.btnAudio.disabled = els.btnVideo.disabled = false;
+    // Bind stream into the active RTCPeerConnection
+    if (rtc.pc) rtc.attachLocalStream(result.stream);
   } else {
     chat.system(`media: ${media.describeFailure()} — text relay only`);
     els.btnAudio.disabled = els.btnVideo.disabled = true;
@@ -771,6 +862,7 @@ signaling.onPeerJoined = (peerId) => {
   if (rtc.isInitiator && rtc.pc) {
     rtc
       .createOffer()
+      .then(() => chat.system("WebRTC SDP offer transmitted to peer"))
       .catch((err) => chat.system(`offer failed: ${err.message}`));
   }
 };
@@ -781,26 +873,58 @@ signaling.onJoined = (_roomId, _peerId, peers, isHost) => {
   if (isHost && els.btnQr) els.btnQr.disabled = false;
   if (!isHost) {
     hidePendingApproval();
+    const hostPeerId = peers[0];
+    if (hostPeerId) rtc.remotePeerId = hostPeerId;
     setupLocalMedia()
-      .then(() => startNativeProximityScan())
+      .then((res) => {
+        const stream = res?.stream || media.stream;
+        if (!rtc.pc) {
+          rtc.createPeerConnection(stream, {
+            remotePeerId: hostPeerId,
+            initiator: false,
+          });
+        } else if (stream) {
+          rtc.attachLocalStream(stream);
+        }
+        startNativeProximityScan();
+      })
       .catch((error) => chat.system(`media setup failed: ${error.message}`));
   }
-  chat.system(`signaling joined — ${peers.length} peer(s) already present`);
+  chat.system(`signaling joined — ${peers.length} peer(s) present`);
 };
 
-signaling.onKnockRequest = showKnockRequest;
+signaling.onKnockRequest = (request) => {
+  if (AUTO_CLEAR_PEERS) {
+    chat.system(`AUTO-ACCEPT: cleared peer ${short(request.peerId)} instant handshake`);
+    pendingKnockPeer = request.peerId;
+    authorizePendingKnock();
+    return;
+  }
+  showKnockRequest(request);
+};
+
 signaling.onJoinPending = () => {
   showPendingApproval();
   chat.system("pending host clearance — connection is not active yet");
 };
+
 signaling.onKnockApproved = ({ peerId }) => {
   clearKnockRequest();
   if (roomIsHost) {
     chat.system(`host authorized peer ${short(peerId)}`);
     rotateHostCapability();
+    rtc.remotePeerId = peerId;
+    if (rtc.isInitiator && rtc.pc) {
+      rtc
+        .createOffer()
+        .then(() => chat.system("WebRTC SDP offer transmitted to peer"))
+        .catch((err) => chat.system(`offer failed: ${err.message}`));
+    }
   } else {
+    hidePendingApproval();
     chat.system("host cleared the request — establishing peer link");
     if (els.remoteTagLabel) els.remoteTagLabel.textContent = "REMOTE // HOST CLEARED — LINKING";
+    setStatus("NEGOTIATING P2P...", "pending");
   }
 };
 signaling.onKnockExpired = ({ peerId, reason }) => {
@@ -1032,6 +1156,10 @@ els.telemetryClearBtn?.addEventListener("click", () => {
   chat.clearTelemetry();
 });
 
+els.btnAutoClear?.addEventListener("click", () => {
+  toggleAutoClear();
+});
+
 els.chatForm.addEventListener("submit", (event) => {
   event.preventDefault(); // no page reload, no history entry
   const value = els.chatInput.value;
@@ -1087,23 +1215,51 @@ function generateInviteToken() {
 }
 
 function parseInvite(value) {
+  if (!value) return null;
+  const str = String(value).trim();
+  if (!str) return null;
+
+  // 1. Try parsing as full URL
   try {
-    const url = new URL(String(value).trim(), window.location.origin);
-    const params = new URLSearchParams(url.hash.replace(/^#/, ""));
-    const roomId = params.get("join");
-    const token = params.get("token");
-    if (
-      !roomId ||
-      !/^[A-Za-z0-9_-]{1,64}$/.test(roomId) ||
-      !token ||
-      !/^[A-Za-z0-9_-]{43}$/.test(token)
-    ) {
-      return null;
+    const url = new URL(str, window.location.origin);
+    const hashParams = new URLSearchParams(url.hash.replace(/^#/, ""));
+    const queryParams = url.searchParams;
+
+    const roomId = hashParams.get("join") || queryParams.get("join") || queryParams.get("room");
+    const token = hashParams.get("token") || queryParams.get("token");
+
+    if (roomId && /^[A-Za-z0-9_-]{1,64}$/.test(roomId)) {
+      return {
+        roomId: roomId.toUpperCase(),
+        token: token && /^[A-Za-z0-9_-]{1,64}$/.test(token) ? token : null,
+        isCodeOnly: !token,
+      };
     }
-    return { roomId, token };
   } catch {
-    return null;
+    /* fallback to regex extraction */
   }
+
+  // 2. Try URL query/hash fragment directly (e.g. "join=ABC123&token=...")
+  const hashMatch = str.match(/join=([A-Za-z0-9_-]{1,64})(?:&token=([A-Za-z0-9_-]{1,64}))?/i);
+  if (hashMatch) {
+    return {
+      roomId: hashMatch[1].toUpperCase(),
+      token: hashMatch[2] || null,
+      isCodeOnly: !hashMatch[2],
+    };
+  }
+
+  // 3. Raw Room Code (3 to 64 alphanumeric characters, e.g. "XYZ123", "482910")
+  const codeMatch = str.match(/^([A-Za-z0-9_-]{3,64})$/);
+  if (codeMatch) {
+    return {
+      roomId: codeMatch[1].toUpperCase(),
+      token: null,
+      isCodeOnly: true,
+    };
+  }
+
+  return null;
 }
 
 const short = (id) => (id || "").slice(0, 6) || "??????";

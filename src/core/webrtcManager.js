@@ -2,11 +2,12 @@
  * GHOST-STREAM // webrtcManager.js
  * Peer-to-peer connection coordinator.
  *
- *  - RTCPeerConnection with public Google STUN servers
+ *  - RTCPeerConnection with public Google STUN & Metered TURN relays
  *  - RTCDataChannel "ephemeral-chat" { ordered: true }
  *    for zero-server text exchange
  *  - Remote media tracks bound to the UI <video> element
  *  - Incoming data-channel packets routed into volatileBuffer
+ *  - Buffered ICE candidates flushed strictly after setRemoteDescription
  *
  * Signaling (offer/answer/ICE) flows through signalingClient;
  * this module owns the RTCPeerConnection itself.
@@ -14,13 +15,29 @@
 
 import { volatileBuffer } from "../memory/volatileBuffer.js";
 
-/** Public Google STUN servers (no TURN — direct P2P only). */
-const ICE_SERVERS = [
+/**
+ * Multi-relay ICE configuration guaranteeing traversal across strict symmetric
+ * cellular NATs (Airtel, Jio, Vi) and restricted firewall networks.
+ */
+export const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
   { urls: "stun:stun2.l.google.com:19302" },
-  { urls: "stun:stun3.l.google.com:19302" },
-  { urls: "stun:stun4.l.google.com:19302" },
+  {
+    urls: "turn:openrelay.metered.ca:80",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: "turn:openrelay.metered.ca:443",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: "turn:openrelay.metered.ca:443?transport=tcp",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
 ];
 
 /** Valid packet types accepted on the data channel. */
@@ -30,6 +47,8 @@ const PACKET_TYPES = new Set([
   "media-state",
   "ping",
   "pong",
+  "crypto-handshake",
+  "crypto-handshake-reply",
 ]);
 
 export class WebRTCManager {
@@ -43,6 +62,9 @@ export class WebRTCManager {
    * @param {Function} [options.onDataChannelOpen]
    * @param {Function} [options.onDataChannelClose]
    * @param {Function} [options.onConnectionState] (state) => void
+   * @param {Function} [options.onIceConnectionState] (state) => void
+   * @param {Function} [options.onSignalingState] (state) => void
+   * @param {Function} [options.onRoundTripTime] (rttMs) => void
    */
   constructor(options = {}) {
     this.signaling = options.signaling;
@@ -61,6 +83,8 @@ export class WebRTCManager {
     this.onDataChannelOpen = options.onDataChannelOpen || null;
     this.onDataChannelClose = options.onDataChannelClose || null;
     this.onConnectionState = options.onConnectionState || null;
+    this.onIceConnectionState = options.onIceConnectionState || null;
+    this.onSignalingState = options.onSignalingState || null;
     this.onRoundTripTime = options.onRoundTripTime || null;
 
     this._pendingCandidates = []; // ICE arriving before remote description
@@ -97,16 +121,40 @@ export class WebRTCManager {
     // Local media out.
     this.localStream = localStream;
     if (localStream) {
-      for (const track of localStream.getTracks())
-        this.pc.addTrack(track, localStream);
+      for (const track of localStream.getTracks()) {
+        try {
+          this.pc.addTrack(track, localStream);
+        } catch (err) {
+          console.warn("[webrtc] failed to add track:", err);
+        }
+      }
     }
 
     // Remote media in -> UI.
     this.pc.ontrack = (event) => this._handleRemoteTrack(event);
 
-    // Connection diagnostics.
+    // Diagnostics & telemetry routing.
     this.pc.onconnectionstatechange = () => {
-      this.onConnectionState?.(this.pc?.connectionState);
+      const state = this.pc?.connectionState;
+      console.info(`[webrtc] connectionState: ${state}`);
+      this.onConnectionState?.(state);
+    };
+
+    this.pc.oniceconnectionstatechange = () => {
+      const state = this.pc?.iceConnectionState;
+      console.info(`[webrtc] iceConnectionState: ${state}`);
+      this.onIceConnectionState?.(state);
+    };
+
+    this.pc.onsignalingstatechange = () => {
+      const state = this.pc?.signalingState;
+      console.info(`[webrtc] signalingState: ${state}`);
+      this.onSignalingState?.(state);
+    };
+
+    this.pc.onicegatheringstatechange = () => {
+      const state = this.pc?.iceGatheringState;
+      console.info(`[webrtc] iceGatheringState: ${state}`);
     };
 
     // Trickle ICE out through signaling.
@@ -129,6 +177,27 @@ export class WebRTCManager {
     }
 
     return this.pc;
+  }
+
+  /**
+   * Safely attach or update the local stream on an existing RTCPeerConnection.
+   * Ensures joiners acquiring media after offer arrival still stream their tracks.
+   * @param {MediaStream|null} stream
+   */
+  attachLocalStream(stream) {
+    this.localStream = stream;
+    if (!this.pc || !stream) return;
+    const senders = typeof this.pc.getSenders === "function" ? this.pc.getSenders() : [];
+    for (const track of stream.getTracks()) {
+      const alreadyAdded = senders.some((s) => s.track === track);
+      if (!alreadyAdded) {
+        try {
+          this.pc.addTrack(track, stream);
+        } catch (err) {
+          console.warn("[webrtc] attachLocalStream error:", err);
+        }
+      }
+    }
   }
 
   /**
@@ -164,6 +233,7 @@ export class WebRTCManager {
 
   /** Initiator: create + publish an SDP offer. */
   async createOffer() {
+    if (!this.pc) throw new Error("RTCPeerConnection not initialized");
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
     if (this.signaling && this.remotePeerId) {
@@ -174,6 +244,7 @@ export class WebRTCManager {
 
   /** Receiver: consume a remote offer, answer, publish the answer. */
   async handleOffer(fromPeerId, sdp) {
+    if (!this.pc) throw new Error("RTCPeerConnection not initialized for offer");
     this.remotePeerId = this.remotePeerId || fromPeerId;
     await this.pc.setRemoteDescription(new RTCSessionDescription(sdp));
     this._remoteDescSet = true;
@@ -181,13 +252,15 @@ export class WebRTCManager {
 
     const answer = await this.pc.createAnswer();
     await this.pc.setLocalDescription(answer);
-    if (this.signaling)
+    if (this.signaling) {
       this.signaling.sendAnswer(this.remotePeerId, this.pc.localDescription);
+    }
     return answer;
   }
 
   /** Initiator: consume the remote answer. */
   async handleAnswer(sdp) {
+    if (!this.pc) return;
     await this.pc.setRemoteDescription(new RTCSessionDescription(sdp));
     this._remoteDescSet = true;
     await this._drainPendingCandidates();
@@ -196,24 +269,26 @@ export class WebRTCManager {
   /** Trickle ICE in — buffered until the remote description exists. */
   async handleIceCandidate(candidate) {
     if (!candidate) return;
-    if (!this._remoteDescSet) {
+    if (!this._remoteDescSet || !this.pc?.remoteDescription) {
       this._pendingCandidates.push(candidate);
       return;
     }
     try {
       await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
     } catch (err) {
-      console.warn("[webrtc] ICE candidate rejected:", err?.name);
+      console.warn("[webrtc] ICE candidate rejected:", err?.name || err?.message);
     }
   }
 
+  /** Flushes buffered candidates strictly after setRemoteDescription. */
   async _drainPendingCandidates() {
+    if (!this.pc || !this.pc.remoteDescription) return;
     const queued = this._pendingCandidates.splice(0);
     for (const candidate of queued) {
       try {
         await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch {
-        /* stale candidate after renegotiation */
+      } catch (err) {
+        console.warn("[webrtc] queued candidate rejected:", err?.name || err?.message);
       }
     }
   }
@@ -338,65 +413,55 @@ export class WebRTCManager {
    * @returns {Promise<boolean>} true if the channel was open and the packet sent
    */
   async sendMessage(text, opts = {}) {
-    const sender = opts.sender || this.signaling?.peerId || "local";
-    const channel = this.dataChannel;
     const packet = {
       type: "chat",
-      sender,
-      text,
+      sender: opts.sender || this.signaling?.peerId,
+      text: String(text),
       at: Date.now(),
       ...(opts.encryption ? { encryption: opts.encryption } : {}),
     };
 
-    if (!channel || channel.readyState === "connecting") {
-      if (this._pendingMessages.length >= 100) {
-        console.warn("[webrtc] pending chat queue is full; message not queued");
-        return false;
+    if (this.dataChannel?.readyState === "open") {
+      const sent = await this.sendPacket(packet);
+      if (sent) {
+        const entry = volatileBuffer.pushMessage({
+          sender: packet.sender || "self",
+          text: packet.text,
+          at: packet.at,
+          kind:
+            packet.encryption === "plaintext-fallback"
+              ? "self-plaintext"
+              : "self",
+        });
+        this.onChatMessage?.(entry);
       }
-      if (!this.pc || this.pc.signalingState === "closed") {
-        console.warn(
-          `[webrtc] message not queued (data channel state: ${channel?.readyState ?? "unavailable"})`,
-        );
-        return false;
-      }
-      this._pendingMessages.push(packet);
-      this._recordLocalMessage(packet);
-      return true;
+      return Boolean(sent);
     }
 
-    if (!channel || channel.readyState !== "open") {
-      console.warn(
-        `[webrtc] data channel not open (readyState: ${channel?.readyState ?? "unavailable"}); message not sent`,
-      );
-      return false;
-    }
-
-    const sent = await this.sendPacket(packet);
-    if (!sent) return false;
-    this._recordLocalMessage(packet);
-    return true;
-  }
-
-  /** @private Record a locally composed message in the RAM store and UI. */
-  _recordLocalMessage(packet) {
+    // Channel still negotiating: queue locally and mirror into volatile buffer.
+    this._pendingMessages.push(packet);
     const entry = volatileBuffer.pushMessage({
-      sender: packet.sender,
+      sender: packet.sender || "self",
       text: packet.text,
+      at: packet.at,
       kind:
         packet.encryption === "plaintext-fallback"
           ? "self-plaintext"
           : "self",
     });
     this.onChatMessage?.(entry);
+    return true;
   }
 
-  /** @private Drain messages queued while the channel was connecting. */
+  /**
+   * @private Drain queued chat messages through an open channel.
+   * Shifts items ONLY after send succeeds so transient failures do not drop text.
+   */
   async _flushPendingMessages(channel) {
     if (this._flushingMessages) return;
     this._flushingMessages = true;
     try {
-      while (this._pendingMessages.length && channel === this.dataChannel) {
-        if (channel.readyState !== "open") return;
+      while (this._pendingMessages.length && channel.readyState === "open") {
         const packet = this._pendingMessages[0];
         const sent = await this.sendPacket(packet);
         if (!sent) {
@@ -447,7 +512,7 @@ export class WebRTCManager {
           this._pendingPings.delete(pingId);
           console.error("[webrtc] RTT ping failed:", error);
         });
-    }
+    };
 
     sendPing();
     this._heartbeatTimer = setInterval(sendPing, 1000);
@@ -492,20 +557,27 @@ export class WebRTCManager {
   _bindSignaling() {
     if (!this.signaling) return;
     this.signaling.onOffer = (from, sdp) => {
-      // Receiver path: ensure a PC exists even if createPeerConnection
-      // was not called before the offer arrived.
-      if (!this.pc) this.createPeerConnection(null, { remotePeerId: from });
+      if (!this.pc) {
+        this.createPeerConnection(this.localStream, { remotePeerId: from, initiator: false });
+      } else {
+        this.remotePeerId = from;
+      }
       this.handleOffer(from, sdp).catch((err) =>
-        console.warn("[webrtc] offer handling failed:", err?.name),
+        console.warn("[webrtc] offer handling failed:", err?.name || err?.message),
       );
     };
-    this.signaling.onAnswer = (_from, sdp) => {
+    this.signaling.onAnswer = (from, sdp) => {
+      if (from) this.remotePeerId = from;
       this.handleAnswer(sdp).catch((err) =>
-        console.warn("[webrtc] answer handling failed:", err?.name),
+        console.warn("[webrtc] answer handling failed:", err?.name || err?.message),
       );
     };
     this.signaling.onIceCandidate = (from, candidate) => {
-      if (!this.pc) this.createPeerConnection(null, { remotePeerId: from });
+      if (!this.pc) {
+        this.createPeerConnection(this.localStream, { remotePeerId: from, initiator: false });
+      } else if (!this.remotePeerId) {
+        this.remotePeerId = from;
+      }
       this.handleIceCandidate(candidate);
     };
   }

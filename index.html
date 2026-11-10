@@ -38,6 +38,7 @@
             <button class="button button-subtle" id="btnCreateRoom" type="button">CREATE ROOM</button>
             <button class="button button-subtle" id="btnJoinRoom" type="button">JOIN ROOM</button>
             <button class="button button-subtle" id="btnQr" type="button" disabled aria-label="Show rotating room invitation QR code">[QR]</button>
+            <button class="button button-subtle" id="btnAutoClear" type="button" data-active="true" aria-pressed="true" title="Auto-authorize peer links without manual approval">AUTO: ON</button>
           </div>
         </div>
 
@@ -260,8 +261,8 @@
         <p>Review the request before opening signaling and media negotiation.</p>
         <p class="knock-countdown">AUTO-REJECT IN <span id="knockCountdown">30s</span></p>
         <div class="knock-actions">
-          <button class="button authorize-button" id="approveKnock" type="button">AUTHORIZE LINK</button>
-          <button class="button reject-button" id="rejectKnock" type="button">REJECT &amp; PURGE</button>
+          <button class="button authorize-button" id="approveKnock" type="button">ACCEPT LINK</button>
+          <button class="button reject-button" id="rejectKnock" type="button">DENY</button>
         </div>
       </section>
     </div>

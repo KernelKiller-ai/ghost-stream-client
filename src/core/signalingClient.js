@@ -189,13 +189,16 @@ export class SignalingClient {
     this.room = room || this.room;
     this.roomToken = token || null;
     this.isHost = Boolean(isHost);
-    return this.send({
+    const payload = {
       type: "join-room",
       roomId: this.room,
       peerId: this.peerId,
-      token: this.roomToken,
       isHost: this.isHost,
-    });
+    };
+    if (this.roomToken) {
+      payload.token = this.roomToken;
+    }
+    return this.send(payload);
   }
 
   leaveRoom() {
@@ -308,6 +311,7 @@ export class SignalingClient {
         this.onKnockRequest?.({
           peerId: msg.peerId,
           timestamp: msg.timestamp,
+          codeOnly: Boolean(msg.codeOnly),
         });
         break;
       case "pending-approval":

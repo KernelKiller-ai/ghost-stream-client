@@ -213,9 +213,10 @@ managerA.createPeerConnection(localA, {
   remotePeerId: "BBBB",
 });
 check(
-  "A uses 5 Google STUN servers",
-  managerA.pc.iceServers.length === 5 &&
-    managerA.pc.iceServers.every((s) => s.urls.startsWith("stun:stun")),
+  "A uses STUN and TURN ICE servers",
+  managerA.pc.iceServers.length === 6 &&
+    managerA.pc.iceServers.some((s) => s.urls.startsWith("stun:")) &&
+    managerA.pc.iceServers.some((s) => s.urls.startsWith("turn:")),
 );
 check(
   "A created ordered data channel",

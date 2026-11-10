@@ -328,17 +328,36 @@ export function renderRoomCode(codeEl, code) {
 }
 
 /**
- * Show/hide the remote "NO CARRIER" fallback based on stream presence.
+ * Show/hide the remote "NO CARRIER" fallback based on stream presence and connection state.
  * @param {HTMLElement} fallbackEl
  * @param {MediaStream|null} stream
+ * @param {string|null} [connectionState]
  */
-export function renderRemoteState(fallbackEl, stream) {
+export function renderRemoteState(fallbackEl, stream, connectionState = null) {
   if (!fallbackEl) return;
   const hasVideo = Boolean(
     stream && stream.getVideoTracks().some((t) => t.readyState === "live"),
   );
-  fallbackEl.classList.toggle("hidden", hasVideo);
-  fallbackEl.closest(".video-primary")?.classList.toggle("has-remote", hasVideo);
+  const isConnected = connectionState === "connected" || connectionState === "live";
+
+  if (hasVideo) {
+    fallbackEl.classList.add("hidden");
+    fallbackEl.closest(".video-primary")?.classList.add("has-remote");
+  } else if (isConnected) {
+    fallbackEl.classList.remove("hidden");
+    fallbackEl.closest(".video-primary")?.classList.add("has-remote");
+    const titleEl = fallbackEl.querySelector(".fallback-title");
+    const copyEl = fallbackEl.querySelector(".fallback-copy");
+    if (titleEl) titleEl.textContent = "AUDIO CARRIER ONLY";
+    if (copyEl) copyEl.textContent = "PEER LINK ACTIVE // VIDEO MUTED OR OFFLINE";
+  } else {
+    fallbackEl.classList.remove("hidden");
+    fallbackEl.closest(".video-primary")?.classList.remove("has-remote");
+    const titleEl = fallbackEl.querySelector(".fallback-title");
+    const copyEl = fallbackEl.querySelector(".fallback-copy");
+    if (titleEl) titleEl.textContent = "NO CARRIER";
+    if (copyEl) copyEl.textContent = "AWAITING SECURE PEER LINK";
+  }
 }
 
 /**
