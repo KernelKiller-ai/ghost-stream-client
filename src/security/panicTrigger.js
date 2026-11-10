@@ -3,11 +3,14 @@
  * Defensive shields + instant zeroization triggers.
  *
  *  1. Page Visibility API — tab hidden/minimized/backgrounded:
- *       - viewport canvas blurred 40px
+ *       - viewport blurred 40px
  *       - video rendering paused
  *  2. ESC pressed twice rapidly (<600ms apart) OR 3-finger tap ->
  *     autoPurge.destroySession() (full zeroization)
- *  3. Right-click context menu suppressed; copy/cut/paste and
+ *  3. Bidirectional remote kill-switch:
+ *       - broadcast FORCE_REMOTE_PURGE to peer
+ *       - obliterate DOM with "SESSION OBLITERATED" lockout screen
+ *  4. Right-click context menu suppressed; copy/cut/paste and
  *     text selection blocked over sensitive viewports.
  * ============================================================ */
 
@@ -23,83 +26,219 @@ let _installed = false;
 let _destroyed = false;
 let _lastEscAt = 0;
 const _cleanups = []; // every listener we install, for uninstall()
-let _hooks = { onPanic: null, onBlur: null, onUnblur: null };
+let _hooks = {
+  onPanic: null,
+  onBlur: null,
+  onUnblur: null,
+  onBroadcastPurge: null,
+};
 
 /* ---------------- small helpers ---------------- */
 
 function addEventListener(target, type, fn, opts) {
+  if (!target || typeof target.addEventListener !== "function") return;
   target.addEventListener(type, fn, opts);
-  _cleanups.push(() => target.removeEventListener(type, fn, opts));
-}
-
-function isVideoElement(el) {
-  return el instanceof HTMLVideoElement;
+  _cleanups.push(() => {
+    try {
+      target.removeEventListener(type, fn, opts);
+    } catch {}
+  });
 }
 
 function stopEvent(event) {
-  event.preventDefault();
-  event.stopPropagation();
+  if (!event) return;
+  try {
+    event.preventDefault();
+    event.stopPropagation();
+  } catch {}
 }
 
 /* ============================================================
  * 1. Page Visibility shield — blur + pause on hide
  * ============================================================ */
 
-/** Apply the visual blackout. Safe to call directly (e.g. from app.js). */
+/** Apply the visual blackout. Safe to call directly. */
 export function blurViewport() {
+  if (typeof document === "undefined" || !document.body) return;
   document.body.style.filter = "blur(40px)";
   document.body.style.transition = "filter 120ms ease";
-  for (const video of document.querySelectorAll("video")) {
-    if (!video.paused) video.pause();
-    video.setAttribute("data-ghost-paused", "1");
+  const videos = document.querySelectorAll ? document.querySelectorAll("video") : [];
+  for (const video of videos) {
+    if (!video.paused && typeof video.pause === "function") video.pause();
+    if (typeof video.setAttribute === "function") {
+      video.setAttribute("data-ghost-paused", "1");
+    }
   }
   _hooks.onBlur?.();
 }
 
 /** Lift the blackout and resume videos we paused ourselves. */
 export function unblurViewport() {
+  if (typeof document === "undefined" || !document.body) return;
   document.body.style.filter = "";
-  for (const video of document.querySelectorAll(
-    'video[data-ghost-paused="1"]',
-  )) {
-    video.removeAttribute("data-ghost-paused");
-    video.play?.().catch(() => {
-      /* autoplay guard */
-    });
+  const videos = document.querySelectorAll
+    ? document.querySelectorAll('video[data-ghost-paused="1"]')
+    : [];
+  for (const video of videos) {
+    if (typeof video.removeAttribute === "function") {
+      video.removeAttribute("data-ghost-paused");
+    }
+    video.play?.().catch?.(() => {});
   }
   _hooks.onUnblur?.();
 }
 
 function installVisibilityShield() {
+  if (typeof document === "undefined") return;
+
   addEventListener(document, "visibilitychange", () => {
     if (document.visibilityState === "hidden") {
       blurViewport(); // minimize / tab switch / background
     } else if (!_destroyed) {
-      unblurViewport(); // only we restore it, and only if the session lives
+      unblurViewport(); // restore only if session lives
     }
   });
 
-  // Belt-and-braces: window blur (e.g. clicking another app without
-  // minimizing) also blurs; focus restores unless purged.
-  addEventListener(window, "blur", () => blurViewport());
-  addEventListener(window, "focus", () => {
-    if (!_destroyed) unblurViewport();
-  });
+  if (typeof window !== "undefined") {
+    addEventListener(window, "blur", () => blurViewport());
+    addEventListener(window, "focus", () => {
+      if (!_destroyed) unblurViewport();
+    });
+  }
 }
 
 /* ============================================================
- * 2. Panic triggers — double-ESC + touch gestures
+ * 2. Panic triggers — double-ESC + touch gestures + kill-switch
  * ============================================================ */
 
 /**
- * Arm the panic triggers. `onPanic` is invoked before the purge so
- * the UI can flash a warning; the purge itself runs either way.
- *
- * @param {{ onPanic?: () => void }} [options]
+ * Render the minimalist "SESSION OBLITERATED" lockout screen in the DOM.
+ */
+export function renderObliteratedScreen() {
+  if (typeof document === "undefined") return;
+
+  // Unblur viewport first so lockout screen is crisp
+  if (document.body && document.body.style) {
+    document.body.style.filter = "";
+  }
+
+  // If the pre-baked lockout modal exists in DOM, activate it
+  const lockoutEl = document.getElementById?.("lockoutScreen");
+  if (lockoutEl && typeof lockoutEl.classList?.remove === "function") {
+    lockoutEl.classList.remove("hidden");
+    const shell = document.getElementById?.("shell");
+    if (shell && typeof shell.classList?.add === "function") {
+      shell.classList.add("hidden");
+    }
+  }
+
+  // In standard browser environment, also overwrite document root
+  try {
+    if (
+      document.documentElement &&
+      typeof document.documentElement.replaceChildren === "function"
+    ) {
+      document.documentElement.replaceChildren();
+
+      const style = document.createElement("style");
+      style.textContent = [
+        "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }",
+        "html, body {",
+        "  width: 100%; height: 100dvh; height: 100vh;",
+        "  background: #070b0e !important; color: #ff3366 !important;",
+        "  font-family: ui-monospace, 'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace !important;",
+        "  display: flex !important; align-items: center !important; justify-content: center !important;",
+        "  overflow: hidden !important; user-select: none !important;",
+        "}",
+        ".lockout-box {",
+        "  text-align: center; padding: 2.5rem 2rem;",
+        "  background: #0d151c; border: 1px solid rgba(255, 51, 102, 0.4);",
+        "  border-radius: 8px; box-shadow: 0 0 60px rgba(255, 51, 102, 0.15);",
+        "  max-width: 440px; margin: 1.5rem;",
+        "}",
+        ".lockout-icon { font-size: 2.75rem; color: #ff3366; margin-bottom: 1rem; }",
+        ".lockout-eyebrow {",
+        "  display: block; font-size: 0.6875rem; letter-spacing: 0.25em;",
+        "  color: #627d98; margin-bottom: 0.5rem; text-transform: uppercase;",
+        "}",
+        ".lockout-title {",
+        "  font-size: 1.25rem; font-weight: 700; letter-spacing: 0.15em;",
+        "  text-transform: uppercase; margin-bottom: 0.75rem; color: #ff3366;",
+        "}",
+        ".lockout-desc {",
+        "  font-size: 0.8125rem; line-height: 1.6; color: #627d98;",
+        "  letter-spacing: 0.05em; margin-bottom: 1.5rem;",
+        "}",
+        ".lockout-badge {",
+        "  display: inline-block; font-size: 0.6875rem; letter-spacing: 0.2em;",
+        "  padding: 0.4rem 0.8rem; border: 1px dashed rgba(255, 51, 102, 0.5);",
+        "  color: #ff3366; background: rgba(255, 51, 102, 0.05);",
+        "}",
+      ].join("\n");
+
+      const box = document.createElement("div");
+      box.className = "lockout-box";
+
+      const icon = document.createElement("div");
+      icon.className = "lockout-icon";
+      icon.textContent = "⚠";
+
+      const eyebrow = document.createElement("span");
+      eyebrow.className = "lockout-eyebrow";
+      eyebrow.textContent = "HARD SECURITY KILL-SWITCH";
+
+      const title = document.createElement("h1");
+      title.className = "lockout-title";
+      title.textContent = "SESSION OBLITERATED";
+
+      const desc = document.createElement("p");
+      desc.className = "lockout-desc";
+      desc.textContent =
+        "RAM buffers zeroized. WebRTC peer connections severed. Camera & mic hardware released. All volatile state purged.";
+
+      const badge = document.createElement("div");
+      badge.className = "lockout-badge";
+      badge.textContent = "ZERO TRACES RETAINED // LOCKOUT ACTIVE";
+
+      if (typeof box.append === "function") {
+        box.append(icon, eyebrow, title, desc, badge);
+      } else if (typeof box.appendChild === "function") {
+        box.appendChild(icon);
+        box.appendChild(eyebrow);
+        box.appendChild(title);
+        box.appendChild(desc);
+        box.appendChild(badge);
+      }
+
+      const body = document.createElement("body");
+      if (typeof body.append === "function") {
+        body.append(style, box);
+      } else if (typeof body.appendChild === "function") {
+        body.appendChild(style);
+        body.appendChild(box);
+      }
+      if (typeof document.documentElement.appendChild === "function") {
+        document.documentElement.appendChild(body);
+      }
+    }
+  } catch (err) {
+    console.error("[panicTrigger] renderObliteratedScreen error:", err);
+  }
+}
+
+/**
+ * Arm the panic triggers: double-ESC and multi-touch gestures.
+ * @param {{ onPanic?: () => void, onBroadcastPurge?: () => void }} [options]
  */
 export function armPanicTriggers(options = {}) {
-  _hooks.onPanic =
-    typeof options.onPanic === "function" ? options.onPanic : _hooks.onPanic;
+  if (typeof options.onPanic === "function") {
+    _hooks.onPanic = options.onPanic;
+  }
+  if (typeof options.onBroadcastPurge === "function") {
+    _hooks.onBroadcastPurge = options.onBroadcastPurge;
+  }
+
+  if (typeof window === "undefined") return;
 
   // --- Double-ESC (within DOUBLE_ESC_WINDOW_MS) ---
   addEventListener(window, "keydown", (event) => {
@@ -107,7 +246,7 @@ export function armPanicTriggers(options = {}) {
       _lastEscAt = 0; // any other key resets the sequence
       return;
     }
-    const now = performance.now();
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (now - _lastEscAt <= DOUBLE_ESC_WINDOW_MS) {
       _lastEscAt = 0;
       triggerZeroization();
@@ -121,7 +260,9 @@ export function armPanicTriggers(options = {}) {
     window,
     "touchstart",
     (event) => {
-      if (event.touches.length >= 3) triggerZeroization();
+      if (event.touches && event.touches.length >= 3) {
+        triggerZeroization();
+      }
     },
     { passive: true },
   );
@@ -132,7 +273,7 @@ export function armPanicTriggers(options = {}) {
     window,
     "touchstart",
     (event) => {
-      if (event.touches.length === 4) {
+      if (event.touches && event.touches.length === 4) {
         holdTimer = setTimeout(triggerZeroization, 800);
       }
     },
@@ -146,15 +287,20 @@ export function armPanicTriggers(options = {}) {
   });
 }
 
-/** Fire the zeroization: hook, purge, shields down. */
+/** Fire the zeroization: broadcast remote purge, wipe RAM, kill media, lockout DOM. */
 export function triggerZeroization() {
   if (_destroyed) return; // idempotent
   _destroyed = true;
+
+  try {
+    _hooks.onBroadcastPurge?.();
+  } catch {}
+
   try {
     _hooks.onPanic?.();
-  } catch {
-    /* UI must not block the purge */
-  }
+  } catch {}
+
+  renderObliteratedScreen();
   autoPurge.destroySession();
 }
 
@@ -163,26 +309,25 @@ export function triggerZeroization() {
  * ============================================================ */
 
 /**
- * Suppress the context menu, copy/cut/paste, and drag-out of
- * sensitive viewports. `selector` scopes the block; the whole
- * document is covered when omitted (chat input stays usable by
- * explicitly being exempted unless includeChat is set).
- *
- * @param {string} [selector] e.g. ".video-primary, .video-pip"
+ * Suppress context menu, copy/cut/paste, and drag-out of sensitive viewports.
+ * @param {string} [selector] e.g. ".stage, .video-container"
  * @param {{ includeChat?: boolean }} [options]
  */
 export function installClipboardShield(selector = null, options = {}) {
-  const sensitive = selector
+  if (typeof document === "undefined") return;
+
+  const sensitive = selector && document.querySelectorAll
     ? Array.from(document.querySelectorAll(selector))
     : [document];
 
   const exempt = (event) => {
     if (options.includeChat) return false;
-    // The chat composer must remain typable/selectable.
-    return event.target.closest?.("#chatInput");
+    return event?.target?.closest?.("#chatInput");
   };
 
   for (const scope of sensitive) {
+    if (!scope) continue;
+
     addEventListener(scope, "contextmenu", (e) => {
       if (!exempt(e)) stopEvent(e);
     });
@@ -191,21 +336,17 @@ export function installClipboardShield(selector = null, options = {}) {
       addEventListener(scope, type, (e) => {
         if (exempt(e)) return;
         stopEvent(e);
-        // Scrub the clipboard payload on copy attempts.
         try {
           if (e.clipboardData) e.clipboardData.setData("text/plain", "");
-        } catch {
-          /* ignore */
-        }
+        } catch {}
       });
     }
 
-    // Block dragging media/images out of the viewport.
     addEventListener(scope, "dragstart", (e) => {
       if (!exempt(e)) stopEvent(e);
     });
 
-    if (scope && typeof scope.addEventListener === "function") {
+    if (typeof scope.addEventListener === "function") {
       addEventListener(scope, "selectstart", (e) => {
         if (!exempt(e)) stopEvent(e);
       });
@@ -215,12 +356,14 @@ export function installClipboardShield(selector = null, options = {}) {
 
 /** Kill keyboard text-selection shortcuts (Ctrl+C/X/A/S/P) globally. */
 export function installKeyShield() {
+  if (typeof window === "undefined") return;
+
   addEventListener(window, "keydown", (event) => {
     if (!event.ctrlKey && !event.metaKey) return;
-    const key = event.key.toLowerCase();
+    const key = (event.key || "").toLowerCase();
     if (
       ["c", "x", "a", "s", "p"].includes(key) &&
-      !event.target.closest?.("#chatInput")
+      !event.target?.closest?.("#chatInput")
     ) {
       stopEvent(event);
     }
@@ -232,17 +375,21 @@ export function installKeyShield() {
  * ============================================================ */
 
 /**
- * Install every shield. Idempotent — a second call is a no-op.
+ * Install every shield. Idempotent.
  * @param {{ selector?: string, includeChat?: boolean,
- *           onPanic?: Function, onBlur?: Function, onUnblur?: Function }} [options]
+ *           onPanic?: Function, onBroadcastPurge?: Function,
+ *           onBlur?: Function, onUnblur?: Function }} [options]
  */
 export function install(options = {}) {
   if (_installed || typeof document === "undefined") return;
   _installed = true;
 
   if (typeof options.onBlur === "function") _hooks.onBlur = options.onBlur;
-  if (typeof options.onUnblur === "function")
-    _hooks.onUnblur = options.onUnblur;
+  if (typeof options.onUnblur === "function") _hooks.onUnblur = options.onUnblur;
+  if (typeof options.onPanic === "function") _hooks.onPanic = options.onPanic;
+  if (typeof options.onBroadcastPurge === "function") {
+    _hooks.onBroadcastPurge = options.onBroadcastPurge;
+  }
 
   installVisibilityShield();
   armPanicTriggers(options);
@@ -255,14 +402,12 @@ export function uninstall() {
   for (const fn of _cleanups.splice(0)) {
     try {
       fn();
-    } catch {
-      /* ignore */
-    }
+    } catch {}
   }
   _installed = false;
   _destroyed = false;
   _lastEscAt = 0;
-  _hooks = { onPanic: null, onBlur: null, onUnblur: null };
+  _hooks = { onPanic: null, onBlur: null, onUnblur: null, onBroadcastPurge: null };
   unblurViewport();
 }
 
@@ -277,6 +422,7 @@ export default {
   blurViewport,
   unblurViewport,
   triggerZeroization,
+  renderObliteratedScreen,
   installClipboardShield,
   status,
 };

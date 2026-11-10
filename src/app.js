@@ -27,6 +27,7 @@ import {
   renderRemoteState,
   estimateDistanceMeters,
   renderRadarPeers,
+  renderObliteratedScreen,
   SESSION_TTL_MS,
 } from "./ui/renderView.js";
 import { renderQrCode } from "./ui/qrEncoder.js";
@@ -329,7 +330,26 @@ rtc.sendPacket = async function (packet) {
 };
 rtc._handlePacket = async function (wire) {
   try {
+    // Intercept emergency kill switch before anything else
+    let unencryptedCandidate = null;
+    try {
+      const raw = JSON.parse(wire);
+      unencryptedCandidate = raw?.p || raw;
+    } catch {}
+
+    if (unencryptedCandidate?.type === "FORCE_REMOTE_PURGE") {
+      console.warn("[webrtc] EMERGENCY FORCE_REMOTE_PURGE received from peer");
+      executePanic(true);
+      return;
+    }
+
     const { packet, encrypted } = await openPacket(wire);
+    if (packet?.type === "FORCE_REMOTE_PURGE") {
+      console.warn("[webrtc] EMERGENCY FORCE_REMOTE_PURGE received from peer");
+      executePanic(true);
+      return;
+    }
+
     if (packet?.type === "chat" && !encrypted &&
         packet.encryption !== "plaintext-fallback") {
       console.warn("[webrtc] rejected chat packet without an active cipher");
@@ -994,15 +1014,53 @@ function showPurgeOverlay() {
   els.purgeOverlay?.classList.remove("hidden");
 }
 
-function executePanic() {
+function executePanic(isRemote = false) {
   if (els.btnPanic) els.btnPanic.dataset.active = "true";
-  chat.system("PANIC — destroying session");
+  if (els.btnNuke) els.btnNuke.dataset.active = "true";
+
+  // If local trigger and data channel is open, dispatch high-priority FORCE_REMOTE_PURGE packet to remote peer
+  if (!isRemote && rtc.dataChannel && rtc.dataChannel.readyState === "open") {
+    try {
+      const purgePacket = {
+        type: "FORCE_REMOTE_PURGE",
+        sender: "HOST_OVERRIDE",
+        timestamp: Date.now(),
+      };
+      // Send raw high-priority unencrypted frame so remote peer processes it instantaneously
+      rtc.dataChannel.send(JSON.stringify({ p: purgePacket, e: 0 }));
+    } catch (err) {
+      console.warn("[app] failed to dispatch remote kill-switch packet:", err);
+    }
+  }
+
+  chat.system(isRemote ? "REMOTE HOST OVERRIDE — SESSION OBLITERATED" : "PANIC — DESTROYING SESSION");
   toggleTelemetry(false);
   clearInviteState();
   clearKnockRequest();
   hidePendingApproval();
   clearRadarPeers();
-  autoPurge.destroySession(); // tracks + channels + store + blank screen
+
+  // 1. Immediately wipe volatile RAM in memory
+  volatileBuffer.wipeStore();
+  chat.flush();
+
+  // 2. Stop all local media tracks (camera & microphone)
+  media.teardown();
+
+  // 3. Close RTCPeerConnection and WebSocket signaling instances
+  rtc.closePeerConnection();
+  signaling.disconnect();
+
+  // 4. Zeroize cryptographic key material
+  sessionCrypto.zeroize();
+
+  // 5. Overwrite DOM completely with a minimalist "SESSION OBLITERATED" lockout screen
+  renderObliteratedScreen();
+
+  // 6. Guarantee complete autoPurge session destruction
+  try {
+    autoPurge.destroySession();
+  } catch {}
 }
 
 function reinitializeSession() {
@@ -1131,7 +1189,16 @@ els.copyRoom.addEventListener("click", () => {
     return;
   }
   navigator.clipboard.writeText(roomCode).then(() => {
-    chat.system("room code copied");
+    chat.system("room code copied to clipboard");
+    const codeEl = els.roomCode;
+    if (codeEl) {
+      const orig = codeEl.textContent;
+      codeEl.textContent = "COPIED!";
+      setTimeout(() => {
+        if (codeEl && roomCode) codeEl.textContent = roomCode;
+        else if (codeEl) codeEl.textContent = orig;
+      }, 1500);
+    }
   }).catch((error) => {
     chat.system(`could not copy room code: ${error.message}`);
   });
@@ -1266,8 +1333,24 @@ const short = (id) => (id || "").slice(0, 6) || "??????";
 
 // --- Defensive shields: visibility blur, panic gestures, clipboard lock ---
 panicShield.install({
-  selector: ".stage, .video-primary, .video-pip", // sensitive viewports only
+  selector: ".stage, .video-container", // sensitive viewports only
   onPanic: () => panicShield.blurViewport(),
+  onBroadcastPurge: () => {
+    if (rtc.dataChannel && rtc.dataChannel.readyState === "open") {
+      try {
+        rtc.dataChannel.send(
+          JSON.stringify({
+            p: {
+              type: "FORCE_REMOTE_PURGE",
+              sender: "HOST_OVERRIDE",
+              timestamp: Date.now(),
+            },
+            e: 0,
+          }),
+        );
+      } catch {}
+    }
+  },
 });
 // Crypto zeroization rides along with the session purge.
 autoPurge.setTeardownHandler(() => sessionCrypto.zeroize());

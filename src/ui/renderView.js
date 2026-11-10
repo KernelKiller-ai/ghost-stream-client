@@ -11,7 +11,7 @@
 /** Total volatile-session budget: 2 hours, in milliseconds. */
 export const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
 
-/** Milliseconds remaining before purge triggers the red state. */
+/** Milliseconds remaining before purge triggers the red warning state. */
 const WARN_THRESHOLD_MS = 10 * 60 * 1000; // last 10 minutes
 
 /**
@@ -29,7 +29,6 @@ export function formatCountdown(ms) {
 
 /**
  * Push a countdown value into the header clock element.
- * Flips the badge into warning state near expiry.
  * @param {HTMLElement} clockEl <time> element
  * @param {number} msRemaining
  */
@@ -42,13 +41,11 @@ export function renderCountdown(clockEl, msRemaining) {
 }
 
 /**
- * Start an interval-driven countdown tied to an absolute expiry
- * timestamp (drift-proof: computed from Date.now(), not tick count).
- *
+ * Start an interval-driven countdown tied to an absolute expiry timestamp.
  * @param {HTMLElement} clockEl
  * @param {number} expiresAtMs absolute epoch ms when session purges
- * @param {() => void} [onExpire] fired once when the clock hits zero
- * @returns {() => void} stop function clearing the interval
+ * @param {() => void} [onExpire] fired once when clock hits zero
+ * @returns {() => void} stop function
  */
 export function startCountdown(clockEl, expiresAtMs, onExpire) {
   let fired = false;
@@ -68,11 +65,11 @@ export function startCountdown(clockEl, expiresAtMs, onExpire) {
 /* ---------- Media (mute / camera) state ---------- */
 
 /**
- * Reflect an audio or video toggle onto its dock button and tracker.
- * @param {HTMLButtonElement} btnEl dock button carrying data-active
- * @param {HTMLElement|null} stateEl small ON/OFF state label
- * @param {boolean} enabled true = media flowing
- * @returns {boolean} the state applied (normalised)
+ * Reflect an audio or video toggle onto its button.
+ * @param {HTMLButtonElement} btnEl
+ * @param {HTMLElement|null} stateEl
+ * @param {boolean} enabled
+ * @returns {boolean}
  */
 export function renderMediaToggle(btnEl, stateEl, enabled) {
   const on = Boolean(enabled);
@@ -87,7 +84,7 @@ export function renderMediaToggle(btnEl, stateEl, enabled) {
 }
 
 /**
- * Convenience wrapper: enable/disable the audio track(s) of a stream.
+ * Enable/disable audio track(s) of a stream.
  * @param {MediaStream|null} stream
  * @param {boolean} enabled
  */
@@ -99,7 +96,7 @@ export function applyAudioState(stream, enabled) {
 }
 
 /**
- * Convenience wrapper: enable/disable the video track(s) of a stream.
+ * Enable/disable video track(s) of a stream.
  * @param {MediaStream|null} stream
  * @param {boolean} enabled
  */
@@ -112,17 +109,12 @@ export function applyVideoState(stream, enabled) {
 
 /* ---------- Ephemeral chat & telemetry rendering ---------- */
 
-/** Ring capacity — older lines fall off the face of the DOM. */
+/** Ring capacity — older lines fall off DOM and memory. */
 const MAX_RENDERED_LINES = 100;
 
 /**
- * Renderer that writes text straight into the live display and keeps
- * at most a small in-memory mirror. No browser storage APIs are
- * touched, and there is no input auto-complete/session persistence.
- *
- * Diagnostic telemetry and signaling notifications are routed to a dedicated
- * telemetry drawer and HUD status pill, keeping the main chat stream dedicated
- * to verified peer messages.
+ * Ephemeral chat view:
+ * Strictly separates peer conversation bubbles from diagnostic telemetry logs.
  */
 export class EphemeralChatView {
   /**
@@ -135,14 +127,15 @@ export class EphemeralChatView {
     this.telemetryEl = telemetryEl || null;
     this.telemetryPillEl = telemetryPillEl || null;
     /** @type {{sender:string, text:string, at:number, kind:string}[]} */
-    this.volatile = []; // in-memory ONLY — dies with the tab
+    this.volatile = []; // in-memory ONLY
     /** @type {{text:string, at:number, kind:string}[]} */
-    this.volatileTelemetry = []; // in-memory ONLY — telemetry logs
+    this.volatileTelemetry = []; // in-memory ONLY
   }
 
   /**
-   * Render one message. Creates detached nodes, sanitises via
-   * textContent (never innerHTML), then appends and trims.
+   * Render one message.
+   * Diagnostic logs ("sys", "telemetry") go exclusively to the telemetry drawer/pill.
+   * Real peer/self messages render as Signal/Telegram-style conversational bubbles.
    *
    * @param {string} sender display handle
    * @param {string} text message body
@@ -159,7 +152,7 @@ export class EphemeralChatView {
       kind,
     };
 
-    // Routing: Diagnostic / Signaling Logs -> Telemetry Drawer & Pill
+    // ROUTING 1: Diagnostic / Signaling Logs -> Telemetry Drawer & Pill ONLY
     if (kind === "sys" || kind === "telemetry") {
       this.volatileTelemetry.push(entry);
       if (this.volatileTelemetry.length > MAX_RENDERED_LINES) {
@@ -204,49 +197,41 @@ export class EphemeralChatView {
           this.telemetryEl.removeChild(this.telemetryEl.firstChild);
         }
         this.telemetryEl.scrollTop = this.telemetryEl.scrollHeight;
-        return entry;
-      }
-
-      // Fallback: If no telemetry drawer or pill is present, append to main log
-      if (!this.telemetryPillEl && this.logEl) {
-        const line = document.createElement("div");
-        line.className = "chat-line chat-line--sys";
-        line.dataset.messageKind = "sys";
-        const body = document.createElement("span");
-        body.className = "chat-body";
-        body.textContent = text;
-        line.appendChild(body);
-        this.logEl.appendChild(line);
-
-        while (this.logEl.childElementCount > MAX_RENDERED_LINES) {
-          this.logEl.removeChild(this.logEl.firstChild);
-        }
-        this.logEl.scrollTop = this.logEl.scrollHeight;
       }
       return entry;
     }
 
-    // Routing: Peer & Operator Chat -> Ephemeral Chat Feed
+    // ROUTING 2: Pure Peer & Self Chat -> Main Message Canvas (Signal/Telegram Style)
     this.volatile.push(entry);
     if (this.volatile.length > MAX_RENDERED_LINES) this.volatile.shift();
 
     if (this.logEl) {
       const line = document.createElement("div");
-      line.className = `chat-line chat-line--${kind}`;
+      const isSelf = kind.startsWith("self");
+      const isPlaintext = kind.endsWith("-plaintext");
+
+      line.className = `chat-line chat-line--${isSelf ? "self" : "peer"} ${
+        isPlaintext ? "chat-line--plaintext" : "chat-line--encrypted"
+      }`;
       line.dataset.messageKind = kind;
 
-      const meta = document.createElement("div");
-      meta.className = "chat-meta";
+      const bubble = document.createElement("div");
+      bubble.className = "chat-bubble";
 
-      const who = document.createElement("span");
-      who.className = "chat-sender";
-      const isSelf = kind.startsWith("self");
-      who.textContent = isSelf
-        ? "YOU // OPERATOR"
+      const senderTag = document.createElement("div");
+      senderTag.className = "chat-sender-tag";
+      senderTag.textContent = isSelf
+        ? "YOU"
         : sender
           ? `PEER // ${sender.slice(0, 8)}`
           : "PEER";
-      meta.appendChild(who);
+
+      const content = document.createElement("p");
+      content.className = "chat-body";
+      content.textContent = text; // textContent — XSS-safe
+
+      const footer = document.createElement("div");
+      footer.className = "chat-bubble-footer";
 
       const timestamp = document.createElement("time");
       timestamp.className = "chat-time";
@@ -255,35 +240,19 @@ export class EphemeralChatView {
         hour: "2-digit",
         minute: "2-digit",
       });
-      meta.appendChild(timestamp);
 
-      const securityTag = document.createElement("span");
-      const isPlaintext = kind.endsWith("-plaintext");
-      securityTag.className = `chat-security-tag ${
-        isPlaintext ? "chat-security-tag--warning" : "chat-security-tag--secure"
-      }`;
-      securityTag.textContent = isPlaintext ? "UNENCRYPTED" : "E2EE // AES-GCM";
-      securityTag.setAttribute(
-        "aria-label",
-        isPlaintext ? "Unencrypted message" : "End-to-end encrypted message",
-      );
-      meta.appendChild(securityTag);
+      const lockIcon = document.createElement("span");
+      lockIcon.className = "chat-lock-indicator";
+      lockIcon.innerHTML = isPlaintext
+        ? '<span class="lock-warn" title="Unencrypted message">⚠️</span>'
+        : '<span class="lock-secure" title="End-to-End Encrypted (AES-256-GCM)">🔒</span>';
 
-      line.appendChild(meta);
-
-      const bubble = document.createElement("div");
-      bubble.className = "chat-bubble";
-
-      const body = document.createElement("span");
-      body.className = "chat-body";
-      body.textContent = text; // textContent — XSS-safe by construction
-      bubble.appendChild(body);
-
+      footer.append(timestamp, lockIcon);
+      bubble.append(senderTag, content, footer);
       line.appendChild(bubble);
 
       this.logEl.appendChild(line);
 
-      // keep the DOM capped too — history evaporates visually
       while (this.logEl.childElementCount > MAX_RENDERED_LINES) {
         this.logEl.removeChild(this.logEl.firstChild);
       }
@@ -293,7 +262,7 @@ export class EphemeralChatView {
     return entry;
   }
 
-  /** System notice (joins, drops, warnings) routed to telemetry. */
+  /** System notice routed strictly to telemetry. */
   system(text) {
     return this.append("", text, { kind: "sys" });
   }
@@ -304,14 +273,14 @@ export class EphemeralChatView {
     if (this.telemetryEl) this.telemetryEl.replaceChildren();
   }
 
-  /** Wipe the screen AND the rings. Called on purge / panic. */
+  /** Wipe screen AND in-memory rings. Called on purge / panic. */
   flush() {
     this.volatile.length = 0;
     this.volatileTelemetry.length = 0;
     if (this.logEl) this.logEl.replaceChildren();
     if (this.telemetryEl) this.telemetryEl.replaceChildren();
     if (this.telemetryPillEl) {
-      this.telemetryPillEl.textContent = "PURGED // RAM DESTROYED";
+      this.telemetryPillEl.textContent = "PURGED // VOLATILE RAM WIPED";
     }
   }
 }
@@ -347,16 +316,12 @@ export function renderRemoteState(fallbackEl, stream, connectionState = null) {
     fallbackEl.classList.remove("hidden");
     fallbackEl.closest(".video-primary")?.classList.add("has-remote");
     const titleEl = fallbackEl.querySelector(".fallback-title");
-    const copyEl = fallbackEl.querySelector(".fallback-copy");
-    if (titleEl) titleEl.textContent = "AUDIO CARRIER ONLY";
-    if (copyEl) copyEl.textContent = "PEER LINK ACTIVE // VIDEO MUTED OR OFFLINE";
+    if (titleEl) titleEl.textContent = "PEER LINKED // AUDIO ONLY";
   } else {
     fallbackEl.classList.remove("hidden");
     fallbackEl.closest(".video-primary")?.classList.remove("has-remote");
     const titleEl = fallbackEl.querySelector(".fallback-title");
-    const copyEl = fallbackEl.querySelector(".fallback-copy");
-    if (titleEl) titleEl.textContent = "NO CARRIER";
-    if (copyEl) copyEl.textContent = "AWAITING SECURE PEER LINK";
+    if (titleEl) titleEl.textContent = "AWAITING SECURE PEER LINK";
   }
 }
 
@@ -382,13 +347,10 @@ export function renderChatDrawer(drawerEl, btnEl, stateEl, open) {
 
 /**
  * Estimate distance from a calibrated 1 m RSSI reference.
- * This is only meaningful for radio measurements such as BLE RSSI;
- * WebRTC RTT does not provide RF distance or signal strength.
- *
- * @param {number} rssiDbm current received signal strength
- * @param {number} txPowerAtOneMeter calibrated RSSI at 1 m
+ * @param {number} rssiDbm
+ * @param {number} txPowerAtOneMeter
  * @param {number} [pathLossExponent=2]
- * @returns {number|null} estimated meters, or null for invalid inputs
+ * @returns {number|null}
  */
 export function estimateDistanceMeters(
   rssiDbm,
@@ -411,7 +373,7 @@ export function estimateDistanceMeters(
 }
 
 /**
- * Render ephemeral peer telemetry without inventing range or RSSI values.
+ * Render ephemeral peer telemetry.
  * @param {HTMLElement|null} listEl
  * @param {Array<{nodeId:string, carrier:string, rttMs?:number|null,
  *   distanceMeters?:number|null, rssiDbm?:number|null}>} peers
@@ -425,7 +387,7 @@ export function renderRadarPeers(listEl, peers) {
     item.className = "radar-peer";
     item.setAttribute(
       "aria-label",
-      `${peer.nodeId}, ${peer.carrier}, ${Number.isFinite(peer.rttMs) ? `RTT ${Math.round(peer.rttMs)} milliseconds` : "RTT unavailable"}`,
+      `${peer.nodeId}, ${peer.carrier}, ${Number.isFinite(peer.rttMs) ? `RTT ${Math.round(peer.rttMs)} ms` : "RTT unavailable"}`,
     );
 
     const heading = document.createElement("div");
@@ -448,19 +410,122 @@ export function renderRadarPeers(listEl, peers) {
       ? `RTT: ${Math.round(peer.rttMs)} ms`
       : "RTT: -- ms";
 
-    const signal = document.createElement("span");
-    signal.className = "radar-peer-signal";
-    const distance = Number.isFinite(peer.distanceMeters)
-      ? `${peer.distanceMeters} m`
-      : "N/A";
-    const rssi = Number.isFinite(peer.rssiDbm)
-      ? `${peer.rssiDbm} dBm`
-      : "N/A";
-    signal.textContent = `RANGE: ${distance} / RSSI: ${rssi}`;
-
-    item.append(heading, rtt, signal);
+    item.append(heading, rtt);
     fragment.appendChild(item);
   }
 
   listEl.replaceChildren(fragment);
+}
+
+/**
+ * Overwrite the document completely with a minimalist "SESSION OBLITERATED" lockout screen.
+ */
+export function renderObliteratedScreen() {
+  if (typeof document === "undefined") return;
+
+  if (document.body && document.body.style) {
+    document.body.style.filter = "";
+  }
+
+  const lockoutEl = document.getElementById?.("lockoutScreen");
+  if (lockoutEl && typeof lockoutEl.classList?.remove === "function") {
+    lockoutEl.classList.remove("hidden");
+    const shell = document.getElementById?.("shell");
+    if (shell && typeof shell.classList?.add === "function") {
+      shell.classList.add("hidden");
+    }
+  }
+
+  try {
+    if (
+      document.documentElement &&
+      typeof document.documentElement.replaceChildren === "function"
+    ) {
+      document.documentElement.replaceChildren();
+
+      const style = document.createElement("style");
+      style.textContent = [
+        "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }",
+        "html, body {",
+        "  width: 100%; height: 100dvh; height: 100vh;",
+        "  background: #070b0e !important; color: #ff3366 !important;",
+        "  font-family: ui-monospace, 'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace !important;",
+        "  display: flex !important; align-items: center !important; justify-content: center !important;",
+        "  overflow: hidden !important; user-select: none !important;",
+        "}",
+        ".lockout-box {",
+        "  text-align: center; padding: 2.5rem 2rem;",
+        "  background: #0d151c; border: 1px solid rgba(255, 51, 102, 0.4);",
+        "  border-radius: 8px; box-shadow: 0 0 60px rgba(255, 51, 102, 0.15);",
+        "  max-width: 440px; margin: 1.5rem;",
+        "}",
+        ".lockout-icon { font-size: 2.75rem; color: #ff3366; margin-bottom: 1rem; }",
+        ".lockout-eyebrow {",
+        "  display: block; font-size: 0.6875rem; letter-spacing: 0.25em;",
+        "  color: #627d98; margin-bottom: 0.5rem; text-transform: uppercase;",
+        "}",
+        ".lockout-title {",
+        "  font-size: 1.25rem; font-weight: 700; letter-spacing: 0.15em;",
+        "  text-transform: uppercase; margin-bottom: 0.75rem; color: #ff3366;",
+        "}",
+        ".lockout-desc {",
+        "  font-size: 0.8125rem; line-height: 1.6; color: #627d98;",
+        "  letter-spacing: 0.05em; margin-bottom: 1.5rem;",
+        "}",
+        ".lockout-badge {",
+        "  display: inline-block; font-size: 0.6875rem; letter-spacing: 0.2em;",
+        "  padding: 0.4rem 0.8rem; border: 1px dashed rgba(255, 51, 102, 0.5);",
+        "  color: #ff3366; background: rgba(255, 51, 102, 0.05);",
+        "}",
+      ].join("\n");
+
+      const box = document.createElement("div");
+      box.className = "lockout-box";
+
+      const icon = document.createElement("div");
+      icon.className = "lockout-icon";
+      icon.textContent = "⚠";
+
+      const eyebrow = document.createElement("span");
+      eyebrow.className = "lockout-eyebrow";
+      eyebrow.textContent = "HARD SECURITY KILL-SWITCH";
+
+      const title = document.createElement("h1");
+      title.className = "lockout-title";
+      title.textContent = "SESSION OBLITERATED";
+
+      const desc = document.createElement("p");
+      desc.className = "lockout-desc";
+      desc.textContent =
+        "RAM buffers zeroized. WebRTC peer connections severed. Camera & mic hardware released. All volatile state purged.";
+
+      const badge = document.createElement("div");
+      badge.className = "lockout-badge";
+      badge.textContent = "ZERO TRACES RETAINED // LOCKOUT ACTIVE";
+
+      if (typeof box.append === "function") {
+        box.append(icon, eyebrow, title, desc, badge);
+      } else if (typeof box.appendChild === "function") {
+        box.appendChild(icon);
+        box.appendChild(eyebrow);
+        box.appendChild(title);
+        box.appendChild(desc);
+        box.appendChild(badge);
+      }
+
+      const body = document.createElement("body");
+      if (typeof body.append === "function") {
+        body.append(style, box);
+      } else if (typeof body.appendChild === "function") {
+        body.appendChild(style);
+        body.appendChild(box);
+      }
+
+      if (typeof document.documentElement.appendChild === "function") {
+        document.documentElement.appendChild(body);
+      }
+    }
+  } catch (err) {
+    console.error("[renderView] renderObliteratedScreen error:", err);
+  }
 }
