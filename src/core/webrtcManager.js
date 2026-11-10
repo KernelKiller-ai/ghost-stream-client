@@ -8,13 +8,14 @@
  *  - Remote media tracks bound to the UI <video> element
  *  - Incoming data-channel packets routed into volatileBuffer
  *  - Buffered ICE candidates flushed strictly after setRemoteDescription
+ *  - Automated sealPacket / openPacket E2EE envelope lifecycle
  *
  * Signaling (offer/answer/ICE) flows through signalingClient;
  * this module owns the RTCPeerConnection itself.
  * ============================================================ */
 
 import { volatileBuffer } from "../memory/volatileBuffer.js";
-import { openPacket } from "../security/cryptoUtils.js";
+import { openPacket, sealPacket } from "../security/cryptoUtils.js";
 
 /**
  * Multi-relay ICE configuration guaranteeing traversal across strict symmetric
@@ -50,6 +51,8 @@ const PACKET_TYPES = new Set([
   "pong",
   "crypto-handshake",
   "crypto-handshake-reply",
+  "FORCE_REMOTE_PURGE",
+  "purge",
 ]);
 
 export class WebRTCManager {
@@ -66,6 +69,7 @@ export class WebRTCManager {
    * @param {Function} [options.onIceConnectionState] (state) => void
    * @param {Function} [options.onSignalingState] (state) => void
    * @param {Function} [options.onRoundTripTime] (rttMs) => void
+   * @param {Function} [options.onPurge] (packet) => void Host kill switch hook
    */
   constructor(options = {}) {
     this.signaling = options.signaling;
@@ -87,6 +91,7 @@ export class WebRTCManager {
     this.onIceConnectionState = options.onIceConnectionState || null;
     this.onSignalingState = options.onSignalingState || null;
     this.onRoundTripTime = options.onRoundTripTime || null;
+    this.onPurge = options.onPurge || null;
 
     this._pendingCandidates = []; // ICE arriving before remote description
     this._remoteDescSet = false;
@@ -184,7 +189,6 @@ export class WebRTCManager {
 
   /**
    * Safely attach or update the local stream on an existing RTCPeerConnection.
-   * Ensures joiners acquiring media after offer arrival still stream their tracks.
    * @param {MediaStream|null} stream
    */
   attachLocalStream(stream) {
@@ -205,7 +209,6 @@ export class WebRTCManager {
 
   /**
    * Full close: data channel then peer connection, references dropped.
-   * Idempotent; also used before any re-negotiation.
    */
   closePeerConnection() {
     if (this.dataChannel) {
@@ -262,7 +265,7 @@ export class WebRTCManager {
     return answer;
   }
 
-  /** Initiator: consume the remote answer. */
+  /** Initiator: consume the remote answer with guard. */
   async handleAnswer(sdp) {
     const pc = this.pc;
     if (!pc) return;
@@ -314,7 +317,6 @@ export class WebRTCManager {
 
   /** @private Bind remote tracks into the remote <video> element. */
   _handleRemoteTrack(event) {
-    // Aggregate stream keeps audio+video synchronised in one srcObject.
     for (const track of event.streams[0]?.getTracks() || [event.track]) {
       if (!this.remoteStream.getTracks().includes(track)) {
         this.remoteStream.addTrack(track);
@@ -328,10 +330,7 @@ export class WebRTCManager {
     }
   }
 
-  /**
-   * Re-bind the remote stream to a (possibly re-rendered) video element.
-   * @param {HTMLVideoElement} el
-   */
+  /** Re-bind the remote stream to a video element. */
   bindRemoteVideo(el) {
     this.remoteVideoEl = el || null;
     if (el && this.remoteStream.getTracks().length) {
@@ -352,7 +351,6 @@ export class WebRTCManager {
       } catch (error) {
         console.error("[webrtc] data channel open callback failed:", error);
       }
-      // First packet announces our presence — no server ever sees this.
       await this.sendPacket({
         type: "presence",
         sender: this.signaling?.peerId,
@@ -381,12 +379,32 @@ export class WebRTCManager {
   }
 
   /**
-   * @private Route an incoming packet: into volatileBuffer, then UI hook.
+   * @private Route an incoming packet: handles remote purge bypass,
+   * unseals crypto envelopes, and dispatches to handler.
    */
   async _handlePacket(raw) {
+    // 1. Direct emergency kill bypass (in case sent unencrypted for instant speed)
+    if (typeof raw === "string" && (raw.includes("FORCE_REMOTE_PURGE") || raw.includes('"type":"purge"'))) {
+      try {
+        const directParsed = JSON.parse(raw);
+        const actual = directParsed.p || directParsed;
+        if (actual.type === "FORCE_REMOTE_PURGE" || actual.type === "purge") {
+          console.warn("[webrtc] Emergency purge signal detected; executing instant nuke...");
+          this.onPurge?.(actual);
+          return true;
+        }
+      } catch {
+        /* proceed to envelope parsing */
+      }
+    }
+
+    // 2. Standard openPacket unseal
     let packet;
+    let encrypted = false;
     try {
-      ({ packet } = await openPacket(raw));
+      const res = await openPacket(raw);
+      packet = res.packet;
+      encrypted = res.encrypted;
     } catch (error) {
       console.warn(
         "[webrtc] incoming data-channel packet rejected:",
@@ -394,28 +412,36 @@ export class WebRTCManager {
       );
       return false;
     }
-    return this._handleDecodedPacket(packet);
+
+    return this._handleDecodedPacket(packet, encrypted);
   }
 
-  /** @private Route an already authenticated/decoded packet. */
-  async _handleDecodedPacket(packet) {
+  /** @private Route an authenticated/decoded packet. */
+  async _handleDecodedPacket(packet, isEncrypted = false) {
     if (!packet || typeof packet !== "object" || Array.isArray(packet)) return false;
-    if (!PACKET_TYPES.has(packet.type)) return;
+    if (!PACKET_TYPES.has(packet.type)) return false;
+
+    // Remote purge trigger after decryption
+    if (packet.type === "FORCE_REMOTE_PURGE" || packet.type === "purge") {
+      console.warn("[webrtc] Remote purge trigger unpacked.");
+      this.onPurge?.(packet);
+      return true;
+    }
 
     if (packet.type === "ping") {
       await this.sendPacket({
         type: "pong",
         pingId: packet.pingId,
       });
-      return;
+      return true;
     }
 
     if (packet.type === "pong") {
       const sentAt = this._pendingPings.get(packet.pingId);
-      if (sentAt === undefined) return;
+      if (sentAt === undefined) return false;
       this._pendingPings.delete(packet.pingId);
       this.onRoundTripTime?.(Math.max(0, performance.now() - sentAt));
-      return;
+      return true;
     }
 
     const entry = volatileBuffer.pushMessage({
@@ -424,9 +450,9 @@ export class WebRTCManager {
       at: typeof packet.at === "number" ? packet.at : Date.now(),
       kind:
         packet.type === "chat"
-          ? packet.encryption === "plaintext-fallback"
-            ? "peer-plaintext"
-            : "peer"
+          ? isEncrypted
+            ? "peer"
+            : "peer-plaintext"
           : "sys",
     });
 
@@ -438,7 +464,7 @@ export class WebRTCManager {
    * Send a text message over the ephemeral data channel.
    * @param {string} text
    * @param {{ sender?: string }} [opts]
-   * @returns {Promise<boolean>} true if the channel was open and the packet sent
+   * @returns {Promise<boolean>}
    */
   async sendMessage(text, opts = {}) {
     const packet = {
@@ -446,7 +472,6 @@ export class WebRTCManager {
       sender: opts.sender || this.signaling?.peerId,
       text: String(text),
       at: Date.now(),
-      ...(opts.encryption ? { encryption: opts.encryption } : {}),
     };
 
     if (this.dataChannel?.readyState === "open") {
@@ -456,35 +481,26 @@ export class WebRTCManager {
           sender: packet.sender || "self",
           text: packet.text,
           at: packet.at,
-          kind:
-            packet.encryption === "plaintext-fallback"
-              ? "self-plaintext"
-              : "self",
+          kind: "self",
         });
         this.onChatMessage?.(entry);
       }
       return Boolean(sent);
     }
 
-    // Channel still negotiating: queue locally and mirror into volatile buffer.
+    // Channel still negotiating: queue locally
     this._pendingMessages.push(packet);
     const entry = volatileBuffer.pushMessage({
       sender: packet.sender || "self",
       text: packet.text,
       at: packet.at,
-      kind:
-        packet.encryption === "plaintext-fallback"
-          ? "self-plaintext"
-          : "self",
+      kind: "self",
     });
     this.onChatMessage?.(entry);
     return true;
   }
 
-  /**
-   * @private Drain queued chat messages through an open channel.
-   * Shifts items ONLY after send succeeds so transient failures do not drop text.
-   */
+  /** Drain queued chat messages through an open channel. */
   async _flushPendingMessages(channel) {
     if (this._flushingMessages) return;
     this._flushingMessages = true;
@@ -492,35 +508,20 @@ export class WebRTCManager {
       while (this._pendingMessages.length && channel.readyState === "open") {
         const packet = this._pendingMessages[0];
         const sent = await this.sendPacket(packet);
-        if (!sent) {
-          console.error(
-            `[webrtc] queued chat message remains queued (readyState: ${channel.readyState})`,
-          );
-          return;
-        }
+        if (!sent) break;
         this._pendingMessages.shift();
       }
     } finally {
       this._flushingMessages = false;
-      if (
-        channel !== this.dataChannel &&
-        this.dataChannel?.readyState === "open" &&
-        this._pendingMessages.length
-      ) {
-        this.flushPendingMessages().catch((error) => {
-          console.error("[webrtc] queued chat retry failed:", error);
-        });
-      }
     }
   }
 
-  /** Retry queued messages when encryption becomes ready after channel open. */
   flushPendingMessages() {
     if (this.dataChannel?.readyState !== "open") return Promise.resolve();
     return this._flushPendingMessages(this.dataChannel);
   }
 
-  /** @private Start the one-second data-channel RTT heartbeat. */
+  /** Start RTT heartbeat. */
   _startHeartbeat(channel) {
     this._stopHeartbeat();
     const sendPing = () => {
@@ -536,9 +537,8 @@ export class WebRTCManager {
         .then((sent) => {
           if (!sent) this._pendingPings.delete(pingId);
         })
-        .catch((error) => {
+        .catch(() => {
           this._pendingPings.delete(pingId);
-          console.error("[webrtc] RTT ping failed:", error);
         });
     };
 
@@ -546,7 +546,6 @@ export class WebRTCManager {
     this._heartbeatTimer = setInterval(sendPing, 1000);
   }
 
-  /** @private Stop heartbeat work and discard outstanding samples. */
   _stopHeartbeat() {
     if (this._heartbeatTimer !== null) {
       clearInterval(this._heartbeatTimer);
@@ -556,11 +555,11 @@ export class WebRTCManager {
   }
 
   /**
-   * Low-level packet send over the ephemeral channel.
-   * @param {{ type: string, sender?: string, text?: string, at?: number }} packet
-   * @returns {boolean|Promise<boolean>}
+   * Low-level packet send: automatically encrypts via sealPacket()
+   * @param {object} packet
+   * @returns {Promise<boolean>}
    */
-  sendPacket(packet) {
+  async sendPacket(packet) {
     if (!this.dataChannel || this.dataChannel.readyState !== "open") {
       console.warn(
         `[webrtc] data channel not open (readyState: ${this.dataChannel?.readyState ?? "unavailable"}); packet not sent`,
@@ -568,7 +567,9 @@ export class WebRTCManager {
       return false;
     }
     try {
-      this.dataChannel.send(JSON.stringify(packet));
+      // Automatic zero-retention encryption envelope
+      const wire = await sealPacket(packet);
+      this.dataChannel.send(wire);
       return true;
     } catch (error) {
       console.error(
