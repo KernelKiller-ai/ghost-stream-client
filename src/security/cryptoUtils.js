@@ -40,6 +40,52 @@ function randomBytes(n) {
 }
 
 /* ============================================================
+ * Base64 & Base64URL Safe Utilities (Robust Implementation)
+ * ============================================================ */
+
+const CHUNK_SIZE = 0x8000;
+
+/** Decode standard or URL-safe Base64 string to Uint8Array safely. */
+export function fromB64(str) {
+  if (!str || typeof str !== "string") {
+    return new Uint8Array(0);
+  }
+  let clean = str.trim().replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  while (clean.length % 4 !== 0) {
+    clean += "=";
+  }
+  const bin = atob(clean);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    bytes[i] = bin.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/** Encode bytes as standard Base64 string. */
+export function toB64(arr) {
+  if (!arr || !(arr instanceof Uint8Array || arr instanceof ArrayBuffer)) {
+    return "";
+  }
+  const bytes = arr instanceof Uint8Array ? arr : new Uint8Array(arr);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK_SIZE));
+  }
+  return btoa(bin);
+}
+
+/** Encode bytes as URL-safe Base64 without padding. */
+export function toB64url(bytes) {
+  return toB64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** Decode URL-safe Base64 string back to Uint8Array safely. */
+export function fromB64url(str) {
+  return fromB64(str);
+}
+
+/* ============================================================
  * Session crypto channel
  * ============================================================ */
 export class EphemeralCrypto {
@@ -51,6 +97,7 @@ export class EphemeralCrypto {
     /** @type {string|null} fingerprint of our ECDH public key (debug/SAS) */
     this._localFingerprint = null;
     this._readyWaiters = new Set();
+    this._pendingPrivate = null;
   }
 
   get isReady() {
@@ -83,8 +130,7 @@ export class EphemeralCrypto {
   }
 
   /**
-   * Step 2a (initiator completes first): mix the peer's public key in
-   * and derive the shared AES-GCM session key.
+   * Step 2a: mix the peer's public key in and derive the shared AES-GCM session key.
    * @param {ArrayBuffer|Uint8Array} peerPublicKey raw ECDH public key from the peer
    */
   async completeHandshake(peerPublicKey) {
@@ -92,13 +138,19 @@ export class EphemeralCrypto {
     if (this._destroyed) throw new Error("crypto channel destroyed");
     if (!this._pendingPrivate) throw new Error("beginHandshake() not called");
 
+    const rawBytes =
+      peerPublicKey instanceof Uint8Array
+        ? peerPublicKey
+        : new Uint8Array(peerPublicKey);
+
     const peerKey = await subtle.importKey(
       "raw",
-      peerPublicKey,
+      rawBytes,
       ECDH_ALGO,
       false,
       [],
     );
+
     this._sessionKey = await subtle.deriveKey(
       { name: "ECDH", public: peerKey },
       this._pendingPrivate,
@@ -106,6 +158,7 @@ export class EphemeralCrypto {
       false, // non-extractable: the raw key never leaves WebCrypto
       ["encrypt", "decrypt"],
     );
+
     // Drop the ECDH private handle reference immediately.
     this._pendingPrivate = null;
     this._notifyReadyWaiters(true);
@@ -148,7 +201,7 @@ export class EphemeralCrypto {
   async encrypt(plaintext) {
     if (!this.isReady) throw new Error("session key not ready or destroyed");
     const subtle = requireSubtle();
-    const iv = randomBytes(IV_BYTES); // fresh IV per message — never reuse
+    const iv = randomBytes(IV_BYTES); // fresh 96-bit IV per message
     const ct = await subtle.encrypt(
       { name: "AES-GCM", iv },
       this._sessionKey,
@@ -159,18 +212,25 @@ export class EphemeralCrypto {
 
   /**
    * Decrypt an envelope produced by encrypt().
-   * @param {{ iv: string, ct: string, v?: number }} envelope
+   * Supports both envelope models (iv/ct and iv/data).
+   * @param {{ iv: string, ct?: string, data?: string, v?: number }} envelope
    * @returns {Promise<string>} plaintext
-   * @throws on tampered/mismatched data (GCM auth failure)
    */
   async decrypt(envelope) {
     if (!this.isReady) throw new Error("session key not ready or destroyed");
+    if (!envelope || !envelope.iv) throw new Error("malformed encrypted envelope");
+
     const subtle = requireSubtle();
-    const iv = fromB64url(envelope.iv);
+    const iv = fromB64(envelope.iv);
+    const ciphertextRaw = envelope.ct || envelope.data;
+
+    if (!ciphertextRaw) throw new Error("missing ciphertext payload");
+    const ct = fromB64(ciphertextRaw);
+
     const pt = await subtle.decrypt(
       { name: "AES-GCM", iv },
       this._sessionKey,
-      fromB64url(envelope.ct),
+      ct,
     );
     return new TextDecoder().decode(pt);
   }
@@ -204,69 +264,39 @@ export const sessionCrypto = new EphemeralCrypto();
 
 /**
  * Wrap a data-channel packet: encrypt its JSON body when the session
- * key is live, otherwise send cleartext JSON (bootstrap phase only —
- * handshakes and presence must flow before the key exists).
+ * key is live, otherwise send cleartext JSON.
  *
  * @param {object} packet
  * @returns {Promise<string>} wire string: {"e":1,"iv":..,"ct":..} or plain JSON
  */
 export async function sealPacket(packet) {
-  if (!sessionCrypto.isReady) return JSON.stringify({ p: packet, e: 0 });
+  if (!sessionCrypto.isReady) {
+    return JSON.stringify({ p: packet, e: 0 });
+  }
   const env = await sessionCrypto.encrypt(JSON.stringify(packet));
   return JSON.stringify({ e: 1, ...env });
 }
 
 /**
  * Unseal an incoming wire string produced by sealPacket().
- * @param {string} wire
+ * @param {string|object} wire
  * @returns {Promise<{ packet: object, encrypted: boolean }>}
- * @throws when marked encrypted but no key / auth failure
  */
 export async function openPacket(wire) {
-  const frame = JSON.parse(wire);
+  const frame = typeof wire === "string" ? JSON.parse(wire) : wire;
   if (!frame || typeof frame !== "object") {
     throw new TypeError("invalid data-channel packet");
   }
-  if (frame.e === 1) {
+
+  if (frame.e === 1 || (frame.iv && (frame.ct || frame.data))) {
     const plaintext = await sessionCrypto.decrypt(frame);
     return { packet: JSON.parse(plaintext), encrypted: true };
   }
+
   return {
     packet: Object.hasOwn(frame, "p") ? frame.p : frame,
     encrypted: false,
   };
-}
-
-/** Decode a standard Base64 string to bytes (used for ECDH public keys). */
-export function fromB64(str) {
-  return Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
-}
-
-/** Encode bytes as standard Base64 (used for ECDH public keys). */
-export function toB64(arr) {
-  return btoa(String.fromCharCode(...arr));
-}
-
-/* ---------------- base64url helpers ---------------- */
-
-const CHUNK_SIZE = 0x8000;
-
-function toB64url(bytes) {
-  let bin = "";
-  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK_SIZE));
-  }
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function fromB64url(str) {
-  const b64 =
-    str.replace(/-/g, "+").replace(/_/g, "/") +
-    "==".slice((str.length + 3) % 4);
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
 }
 
 export default EphemeralCrypto;
