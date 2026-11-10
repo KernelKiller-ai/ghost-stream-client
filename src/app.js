@@ -16,11 +16,18 @@ import { WebRTCManager } from "./core/webrtcManager.js";
 import { volatileBuffer } from "./memory/volatileBuffer.js";
 import * as autoPurge from "./memory/autoPurge.js";
 import { stopSession } from "./memory/autoPurge.js";
-import { sessionCrypto, sealPacket, openPacket } from "./security/cryptoUtils.js";
+import {
+  sessionCrypto,
+  sealPacket,
+  openPacket,
+  fromB64,
+  toB64,
+} from "./security/cryptoUtils.js";
 import * as panicShield from "./security/panicTrigger.js";
 import {
   EphemeralChatView,
   renderRoomCode,
+  renderParticipantPresence,
   renderCountdown,
   renderMediaToggle,
   renderChatDrawer,
@@ -36,6 +43,15 @@ import { renderQrCode } from "./ui/qrEncoder.js";
 const $ = (id) => document.getElementById(id);
 const els = {
   roomCode: $("roomCodeDisplay"),
+  peerAvatar: $("peerCardAvatar"),
+  peerStackAvatar: $("peerStackAvatar"),
+  peerCard: $("videoPrimaryWrapper"),
+  peerCardName: $("peerCardName"),
+  peerCardStatus: $("peerCardStatus"),
+  peerCardTag: $("peerCardTag"),
+  participantCount: $("participantCount"),
+  localCardRole: $("localCardRole"),
+  localRoleTag: $("localRoleTag"),
   copyRoom: $("copyRoom"),
   btnCreateRoom: $("btnCreateRoom"),
   btnJoinRoom: $("btnJoinRoom"),
@@ -213,6 +229,7 @@ const rtc = new WebRTCManager({
   onDataChannelOpen: async () => {
     chat.system("ephemeral channel open — serverless relay active");
     setStatus("LINKED", "live");
+    updateParticipantPresence(true);
     setChatControlsEnabled(true);
     await startCryptoHandshake();
     updateWebRtcRadarPeer();
@@ -220,6 +237,7 @@ const rtc = new WebRTCManager({
   onDataChannelClose: () => {
     chat.system("ephemeral channel closed");
     setStatus("AWAITING LINK", "idle");
+    updateParticipantPresence(false);
     setChatControlsEnabled(false);
     removeWebRtcRadarPeer();
   },
@@ -330,20 +348,8 @@ rtc.sendPacket = async function (packet) {
 };
 rtc._handlePacket = async function (wire) {
   try {
-    // Intercept emergency kill switch before anything else
-    let unencryptedCandidate = null;
-    try {
-      const raw = JSON.parse(wire);
-      unencryptedCandidate = raw?.p || raw;
-    } catch {}
-
-    if (unencryptedCandidate?.type === "FORCE_REMOTE_PURGE") {
-      console.warn("[webrtc] EMERGENCY FORCE_REMOTE_PURGE received from peer");
-      executePanic(true);
-      return;
-    }
-
     const { packet, encrypted } = await openPacket(wire);
+    if (!packet || typeof packet !== "object" || Array.isArray(packet)) return;
     if (packet?.type === "FORCE_REMOTE_PURGE") {
       console.warn("[webrtc] EMERGENCY FORCE_REMOTE_PURGE received from peer");
       executePanic(true);
@@ -366,8 +372,7 @@ rtc._handlePacket = async function (wire) {
     if (packet.type === "crypto-handshake-reply") {
       return handleCryptoHandshakeReply(packet);
     }
-    // Route through the original renderer (chat / presence / media-state).
-    WebRTCManager.prototype._handlePacket.call(this, JSON.stringify(packet));
+    return WebRTCManager.prototype._handleDecodedPacket.call(this, packet);
   } catch (error) {
     console.error("[webrtc] incoming encrypted packet rejected:", error);
   }
@@ -393,6 +398,7 @@ function toggleAutoClear(value) {
 
 function notifyCryptoReady() {
   if (!sessionCrypto.isReady) return;
+  updateParticipantPresence(true);
   rtc.flushPendingMessages().catch((error) => {
     console.error("[app] queued chat flush failed:", error);
   });
@@ -403,6 +409,15 @@ const setStatus = (text, state) => {
   const dot = document.querySelector(".video-tag--remote .status-dot");
   if (dot) dot.dataset.state = state || "idle";
 };
+
+function updateParticipantPresence(connected = false) {
+  renderParticipantPresence(
+    { ...els, isHost: roomIsHost },
+    connected,
+    rtc.remotePeerId || "",
+    sessionCrypto.isReady,
+  );
+}
 
 function showInviteModal() {
   if (!roomCode || !roomIsHost || !hostJoined) {
@@ -504,6 +519,7 @@ function clearInviteState() {
   roomToken = null;
   roomIsHost = false;
   hostJoined = false;
+  updateParticipantPresence(false);
   if (els.btnQr) els.btnQr.disabled = true;
 }
 
@@ -589,6 +605,7 @@ function cancelPendingJoin() {
   signaling.disconnect();
   stopSession();
   rtc.closePeerConnection();
+  updateParticipantPresence(false);
   media.teardown();
   roomCode = null;
   roomToken = null;
@@ -608,6 +625,7 @@ async function handleCreateRoom() {
     roomToken = generateInviteToken();
     roomIsHost = true;
     hostJoined = false;
+    updateParticipantPresence(false);
     renderRoomCode(els.roomCode, roomCode);
     chat.system(`room ${roomCode} created — link valid 2 hours`);
     setStatus("CONNECTING...", "pending");
@@ -808,7 +826,7 @@ async function startCryptoHandshake() {
       const sent = await rtc.sendPacket({
         type: "crypto-handshake",
         sender: signaling.peerId,
-        key: toB64(publicKey),
+        key: toB64(new Uint8Array(publicKey)),
       });
       if (!sent) {
         console.warn("[app] could not send initial encryption handshake; channel queue active");
@@ -819,12 +837,6 @@ async function startCryptoHandshake() {
     });
   }
   await cryptoHandshakePromise;
-}
-
-function toB64(buf) {
-  let bin = "";
-  for (const b of new Uint8Array(buf)) bin += String.fromCharCode(b);
-  return btoa(bin);
 }
 
 /**
@@ -840,7 +852,7 @@ async function handleCryptoHandshake(packet) {
     const sent = await rtc.sendPacket({
       type: "crypto-handshake-reply",
       sender: signaling.peerId,
-      key: toB64(publicKey),
+      key: toB64(new Uint8Array(publicKey)),
     });
     if (!sent) throw new Error("could not send encryption handshake reply");
     notifyCryptoReady();
@@ -1188,8 +1200,11 @@ els.copyRoom.addEventListener("click", () => {
     chat.system("create or join a room before copying its code");
     return;
   }
-  navigator.clipboard.writeText(roomCode).then(() => {
-    chat.system("room code copied to clipboard");
+  const inviteUrl = new URL(window.location.href);
+  const hostToken = roomIsHost && roomToken ? `&token=${encodeURIComponent(roomToken)}` : "";
+  inviteUrl.hash = `join=${encodeURIComponent(roomCode)}${hostToken}`;
+  navigator.clipboard.writeText(inviteUrl.toString()).then(() => {
+    chat.system("room invite link copied to clipboard");
     const codeEl = els.roomCode;
     if (codeEl) {
       const orig = codeEl.textContent;

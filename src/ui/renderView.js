@@ -221,10 +221,10 @@ export class EphemeralChatView {
       const senderTag = document.createElement("div");
       senderTag.className = "chat-sender-tag";
       senderTag.textContent = isSelf
-        ? "YOU"
+        ? "You"
         : sender
-          ? `PEER // ${sender.slice(0, 8)}`
-          : "PEER";
+          ? sender.slice(0, 8)
+          : "Peer";
 
       const content = document.createElement("p");
       content.className = "chat-body";
@@ -294,6 +294,49 @@ export class EphemeralChatView {
  */
 export function renderRoomCode(codeEl, code) {
   if (codeEl) codeEl.textContent = String(code || "----");
+}
+
+/** Update the room's compact participant cards and avatar stack. */
+export function renderParticipantPresence(
+  elements,
+  connected,
+  peerId = "",
+  encrypted = false,
+) {
+  const isConnected = Boolean(connected);
+  const initials = String(peerId || "P").replace(/[^a-z0-9]/gi, "").slice(0, 1).toUpperCase() || "P";
+  const peerName = peerId ? `Peer ${peerId.slice(0, 6)}` : "Peer";
+  if (elements.peerAvatar) elements.peerAvatar.textContent = initials;
+  if (elements.peerStackAvatar) elements.peerStackAvatar.textContent = isConnected ? initials : "+";
+  if (elements.peerCardName) elements.peerCardName.textContent = peerName;
+  if (elements.peerCardStatus) {
+    elements.peerCardStatus.textContent = isConnected
+      ? encrypted
+        ? "Connected · encrypted"
+        : "Connected · securing link"
+      : "Waiting for someone to join";
+  }
+  if (elements.peerCardTag) {
+    elements.peerCardTag.textContent = encrypted
+      ? "Encrypted"
+      : isConnected
+        ? "Securing"
+        : "Waiting";
+  }
+  if (elements.peerCard) elements.peerCard.dataset.connected = String(isConnected);
+  if (elements.participantCount) {
+    elements.participantCount.textContent = isConnected ? "2 in room" : "Just you";
+  }
+  if (elements.localCardRole) {
+    elements.localCardRole.textContent = isConnected
+      ? encrypted
+        ? "Secure chat is ready"
+        : "Establishing secure chat"
+      : "Waiting for a peer";
+  }
+  if (elements.localRoleTag) {
+    elements.localRoleTag.textContent = elements.isHost ? "Host" : "Guest";
+  }
 }
 
 /**
@@ -448,34 +491,34 @@ export function renderObliteratedScreen() {
         "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }",
         "html, body {",
         "  width: 100%; height: 100dvh; height: 100vh;",
-        "  background: #070b0e !important; color: #ff3366 !important;",
-        "  font-family: ui-monospace, 'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace !important;",
+        "  background: #120924 !important; color: #f7f3ff !important;",
+        "  font-family: Inter, 'Plus Jakarta Sans', system-ui, sans-serif !important;",
         "  display: flex !important; align-items: center !important; justify-content: center !important;",
         "  overflow: hidden !important; user-select: none !important;",
         "}",
         ".lockout-box {",
         "  text-align: center; padding: 2.5rem 2rem;",
-        "  background: #0d151c; border: 1px solid rgba(255, 51, 102, 0.4);",
-        "  border-radius: 8px; box-shadow: 0 0 60px rgba(255, 51, 102, 0.15);",
+        "  background: rgba(37, 24, 61, 0.96); border: 1px solid rgba(239, 68, 68, 0.4);",
+        "  border-radius: 24px; box-shadow: 0 0 60px rgba(139, 92, 246, 0.2);",
         "  max-width: 440px; margin: 1.5rem;",
         "}",
-        ".lockout-icon { font-size: 2.75rem; color: #ff3366; margin-bottom: 1rem; }",
+        ".lockout-icon { font-size: 2.75rem; color: #f87171; margin-bottom: 1rem; }",
         ".lockout-eyebrow {",
         "  display: block; font-size: 0.6875rem; letter-spacing: 0.25em;",
-        "  color: #627d98; margin-bottom: 0.5rem; text-transform: uppercase;",
+        "  color: #b6a9d2; margin-bottom: 0.5rem; text-transform: uppercase;",
         "}",
         ".lockout-title {",
         "  font-size: 1.25rem; font-weight: 700; letter-spacing: 0.15em;",
-        "  text-transform: uppercase; margin-bottom: 0.75rem; color: #ff3366;",
+        "  text-transform: uppercase; margin-bottom: 0.75rem; color: #fca5a5;",
         "}",
         ".lockout-desc {",
-        "  font-size: 0.8125rem; line-height: 1.6; color: #627d98;",
+        "  font-size: 0.8125rem; line-height: 1.6; color: #b6a9d2;",
         "  letter-spacing: 0.05em; margin-bottom: 1.5rem;",
         "}",
         ".lockout-badge {",
         "  display: inline-block; font-size: 0.6875rem; letter-spacing: 0.2em;",
-        "  padding: 0.4rem 0.8rem; border: 1px dashed rgba(255, 51, 102, 0.5);",
-        "  color: #ff3366; background: rgba(255, 51, 102, 0.05);",
+        "  padding: 0.4rem 0.8rem; border: 1px dashed rgba(239, 68, 68, 0.5);",
+        "  border-radius: 999px; color: #fca5a5; background: rgba(239, 68, 68, 0.16);",
         "}",
       ].join("\n");
 

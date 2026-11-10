@@ -22,6 +22,8 @@ globalThis.WebSocket = class FakeWebSocket {
 const { SignalingClient } = await import("../src/core/signalingClient.js");
 const { WebRTCManager } = await import("../src/core/webrtcManager.js");
 const { volatileBuffer } = await import("../src/memory/volatileBuffer.js");
+const { EphemeralCrypto, sessionCrypto, sealPacket } =
+  await import("../src/security/cryptoUtils.js");
 
 let failures = 0;
 const check = (name, cond) => {
@@ -93,9 +95,17 @@ class FakeRTCPeerConnection {
   }
   async setLocalDescription(desc) {
     this.localDescription = desc;
+    this.signalingState =
+      desc.type === "offer" ? "have-local-offer" : "stable";
   }
   async setRemoteDescription(desc) {
+    if (desc.type === "answer") {
+      this.answerApplications = (this.answerApplications || 0) + 1;
+      await Promise.resolve();
+    }
     this.remoteDescription = desc;
+    this.signalingState =
+      desc.type === "offer" ? "have-remote-offer" : "stable";
     // Simulate ondatachannel for remote offers (receiver path).
     if (desc.type === "offer" && this._remoteChannel) {
       const ch = this._remoteChannel;
@@ -286,10 +296,23 @@ await managerA.handleIceCandidate({
 });
 check("ICE queued before remote description", managerA._pendingCandidates.length === 1);
 // simulate B answering back through the pipe
-await managerA.handleAnswer({ type: "answer", sdp: "answer-sdp" });
+const firstAnswer = managerA.handleAnswer({ type: "answer", sdp: "answer-sdp" });
+const duplicateAnswer = managerA.handleAnswer({
+  type: "answer",
+  sdp: "duplicate-answer",
+});
+await Promise.all([firstAnswer, duplicateAnswer]);
 check(
   "A accepted remote answer",
   managerA.pc.remoteDescription?.type === "answer",
+);
+const acceptedAnswer = managerA.pc.remoteDescription;
+await managerA.handleAnswer({ type: "answer", sdp: "duplicate-answer" });
+check(
+  "concurrent duplicate answer is skipped",
+  managerA.pc.remoteDescription === acceptedAnswer &&
+    managerA.pc.signalingState === "stable" &&
+    managerA.pc.answerApplications === 1,
 );
 check(
   "queued ICE drained after remote description",
@@ -411,6 +434,27 @@ check(
   "malformed/unknown packets ignored",
   !volatileBuffer.getMessages().some((m) => m.text === "<img>"),
 );
+
+const senderCrypto = new EphemeralCrypto();
+const receiverPublicKey = (await sessionCrypto.beginHandshake()).publicKey;
+const senderPublicKey = (await senderCrypto.beginHandshake()).publicKey;
+await sessionCrypto.completeHandshake(senderPublicKey);
+await senderCrypto.completeHandshake(receiverPublicKey);
+const encryptedWire = await sealPacket({
+  type: "chat",
+  sender: "AAAA",
+  text: "decrypted by WebRTCManager",
+});
+await managerB._handlePacket(encryptedWire);
+check(
+  "WebRTCManager decrypts before routing incoming packets",
+  chatB.some((entry) => entry.text === "decrypted by WebRTCManager") &&
+    volatileBuffer
+      .getMessages()
+      .some((entry) => entry.text === "decrypted by WebRTCManager"),
+);
+sessionCrypto.zeroize();
+senderCrypto.zeroize();
 
 // channel closed -> sendPacket returns false
 managerA.dataChannel.close();

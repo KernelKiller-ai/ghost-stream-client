@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#070b0e" />
+    <meta name="theme-color" content="#1a102f" />
     <meta name="color-scheme" content="dark" />
     <meta name="robots" content="noindex, nofollow, noarchive, nosnippet" />
     <meta
@@ -22,18 +22,28 @@
       <header class="topbar">
         <div class="topbar-left">
           <div class="brand">
-            <span class="brand-dot" aria-hidden="true"></span>
-            <span class="brand-title">Ghost-Stream</span>
+            <span class="brand-mark" aria-hidden="true">g</span>
+            <div class="brand-copy">
+              <span class="brand-title">Ghost-Stream</span>
+              <span class="brand-subtitle">Private room · end-to-end encrypted</span>
+            </div>
           </div>
-          <span class="security-badge" title="Zero disk retention: all messages and keys reside in volatile RAM only">
-            ● RAM-ONLY // E2EE
-          </span>
         </div>
 
         <div class="topbar-center">
-          <button class="room-pill" id="copyRoom" type="button" aria-label="Copy room code to clipboard" title="Click to copy room code">
+          <div class="room-heading">
+            <span class="room-heading-title">Accountability room</span>
+            <span class="room-heading-members">
+              <span class="avatar-stack" aria-hidden="true">
+                <span class="avatar avatar--you">Y</span>
+                <span class="avatar avatar--peer" id="peerStackAvatar">+</span>
+              </span>
+              <span id="participantCount">Just you</span>
+            </span>
+          </div>
+          <button class="room-pill" id="copyRoom" type="button" aria-label="Copy room invite link" title="Click to copy room invite link">
             <span class="room-pill-status"></span>
-            <span class="room-pill-label">ROOM</span>
+            <span class="room-pill-label">LINK</span>
             <code class="room-pill-code" id="roomCodeDisplay" data-room-code>----</code>
             <svg class="room-pill-icon" viewBox="0 0 24 24" aria-hidden="true">
               <rect x="8" y="8" width="12" height="12" rx="2"></rect>
@@ -63,32 +73,6 @@
             </button>
           </div>
 
-          <!-- Hardware Toggles -->
-          <div class="media-actions-group">
-            <button class="icon-toggle" id="btnAudio" type="button" data-active="false" aria-label="Toggle microphone" aria-pressed="false" disabled title="Toggle Mic">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <rect x="9" y="2" width="6" height="12" rx="3"></rect>
-                <path d="M5 10v2a7 7 0 0 0 14 0v-2m-7 9v3m-4 0h8"></path>
-              </svg>
-              <span class="sr-only" id="audioState">OFF</span>
-            </button>
-            <button class="icon-toggle" id="btnVideo" type="button" data-active="false" aria-label="Toggle camera" aria-pressed="false" disabled title="Toggle Cam">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <rect x="3" y="6" width="13" height="12" rx="2"></rect>
-                <path d="m16 10 5-3v10l-5-3"></path>
-              </svg>
-              <span class="sr-only" id="videoState">OFF</span>
-            </button>
-          </div>
-
-          <!-- Instant Purge Button (Panic / Kill-Switch) -->
-          <button class="btn-instant-purge" id="btnNuke" type="button" aria-label="Instant Purge: obliterate session on both devices" title="INSTANT PURGE (Double-ESC / Click)">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 3 2.8 19a1.4 1.4 0 0 0 1.2 2.1h16a1.4 1.4 0 0 0 1.2-2.1L12 3Z"></path>
-              <path d="M12 9v5m0 3h.01"></path>
-            </svg>
-            <span class="purge-text">PURGE</span>
-          </button>
         </div>
       </header>
 
@@ -140,12 +124,28 @@
               <span class="fallback-status-dot"></span>
               <span class="fallback-title" id="remoteTagLabel">REMOTE // AWAITING SECURE PEER LINK</span>
             </div>
+            <div class="participant-card-footer">
+              <span class="participant-avatar participant-avatar--peer" id="peerCardAvatar">P</span>
+              <span class="participant-identity">
+                <strong id="peerCardName">Peer</strong>
+                <small id="peerCardStatus">Waiting for someone to join</small>
+              </span>
+              <span class="participant-tag" id="peerCardTag">Waiting</span>
+            </div>
           </div>
 
           <div class="video-pip" id="videoPipWrapper" aria-label="Local camera preview">
             <video id="videoLocal" autoplay playsinline muted></video>
             <div class="pip-placeholder" aria-hidden="true">
-              <span>LOCAL CAM</span>
+              <span class="local-avatar">Y</span>
+            </div>
+            <div class="participant-card-footer">
+              <span class="participant-avatar participant-avatar--you">Y</span>
+              <span class="participant-identity">
+                <strong>You</strong>
+                <small id="localCardRole">In the room</small>
+              </span>
+              <span class="participant-tag" id="localRoleTag">Guest</span>
             </div>
           </div>
         </section>
@@ -163,9 +163,33 @@
 
         <!-- DOCKED BOTTOM INPUT AREA (ZERO OVERLAP, SAFE-AREA DOCKED) -->
         <div class="chat-dock-container">
+          <div class="floating-controls" aria-label="Room controls">
+            <div class="media-actions-group">
+              <button class="icon-toggle" id="btnAudio" type="button" data-active="false" aria-label="Toggle microphone" aria-pressed="false" disabled title="Toggle microphone">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="9" y="2" width="6" height="12" rx="3"></rect>
+                  <path d="M5 10v2a7 7 0 0 0 14 0v-2m-7 9v3m-4 0h8"></path>
+                </svg>
+                <span class="sr-only" id="audioState">OFF</span>
+              </button>
+              <button class="icon-toggle" id="btnVideo" type="button" data-active="false" aria-label="Toggle camera" aria-pressed="false" disabled title="Toggle camera">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="3" y="6" width="13" height="12" rx="2"></rect>
+                  <path d="m16 10 5-3v10l-5-3"></path>
+                </svg>
+                <span class="sr-only" id="videoState">OFF</span>
+              </button>
+            </div>
+            <button class="btn-instant-purge" id="btnNuke" type="button" aria-label="Instant Purge: obliterate session on both devices" title="Instantly purge this session">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3 2.8 19a1.4 1.4 0 0 0 1.2 2.1h16a1.4 1.4 0 0 0 1.2-2.1L12 3Z"></path>
+                <path d="M12 9v5m0 3h.01"></path>
+              </svg>
+              <span class="purge-text">Purge</span>
+            </button>
+          </div>
           <form class="chat-compose" id="chatForm" autocomplete="off">
             <div class="compose-input-wrapper">
-              <span class="compose-prefix" aria-hidden="true">&gt;</span>
               <input
                 id="chatInput"
                 name="throwaway-no-persist"
@@ -176,7 +200,7 @@
                 autocorrect="off"
                 autocapitalize="off"
                 spellcheck="false"
-                placeholder="Connect to peer to send encrypted message..."
+                placeholder="Write a message..."
                 aria-label="Message to transmit"
               />
             </div>

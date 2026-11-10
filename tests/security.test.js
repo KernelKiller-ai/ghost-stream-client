@@ -4,7 +4,7 @@
 
 const subtle = globalThis.crypto.subtle;
 
-const { EphemeralCrypto, sealPacket, openPacket, sessionCrypto } =
+const { EphemeralCrypto, sealPacket, openPacket, sessionCrypto, fromB64, toB64 } =
   await import("../src/security/cryptoUtils.js");
 let panic;
 try {
@@ -20,6 +20,12 @@ const check = (name, cond) => {
 };
 
 /* ---------------- cryptoUtils ---------------- */
+
+const base64Bytes = new Uint8Array([0, 1, 127, 128, 255]);
+check(
+  "Base64 helpers round-trip ECDH key bytes",
+  fromB64(toB64(base64Bytes)).every((byte, index) => byte === base64Bytes[index]),
+);
 
 // Two peers derive the same key via ECDH and exchange sealed packets.
 const alice = new EphemeralCrypto();
@@ -171,7 +177,8 @@ if (panic) {
   }
   let videoPaused = false,
     videoResumed = false,
-    panicFired = 0;
+    panicFired = 0,
+    purgeBroadcasts = 0;
   function fakeVideo() {
     return {
       paused: false,
@@ -217,7 +224,10 @@ if (panic) {
     appendChild() {},
   };
 
-  panic.install({ onPanic: () => panicFired++ });
+  panic.install({
+    onPanic: () => panicFired++,
+    onBroadcastPurge: () => purgeBroadcasts++,
+  });
 
   // 1. Visibility: hide -> blur + pause
   doc.visibilityState = "hidden";
@@ -239,6 +249,7 @@ if (panic) {
   fire("window", "keydown", { key: "Escape" });
   fire("window", "keydown", { key: "Escape" });
   check("double-ESC triggers panic hook", panicFired >= 1);
+  check("double-ESC broadcasts remote purge once", purgeBroadcasts === 1);
   check("double-ESC triggers zeroization", purgeMod.status().destroyed === true && navigatedTo === "about:blank");
   panic.triggerZeroization(); // second call must be a no-op
   check("panic idempotent", purgeMod.status().destroyed === true);

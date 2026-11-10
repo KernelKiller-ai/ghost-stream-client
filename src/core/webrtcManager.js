@@ -14,6 +14,7 @@
  * ============================================================ */
 
 import { volatileBuffer } from "../memory/volatileBuffer.js";
+import { openPacket } from "../security/cryptoUtils.js";
 
 /**
  * Multi-relay ICE configuration guaranteeing traversal across strict symmetric
@@ -89,6 +90,7 @@ export class WebRTCManager {
 
     this._pendingCandidates = []; // ICE arriving before remote description
     this._remoteDescSet = false;
+    this._answerPending = false;
     this._pendingMessages = [];
     this._flushingMessages = false;
     this._pendingPings = new Map();
@@ -115,6 +117,7 @@ export class WebRTCManager {
     this.remotePeerId = opts.remotePeerId || null;
     this._pendingCandidates = [];
     this._remoteDescSet = false;
+    this._answerPending = false;
 
     this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
@@ -225,6 +228,7 @@ export class WebRTCManager {
     if (this.remoteVideoEl) this.remoteVideoEl.srcObject = null;
     this._remoteDescSet = false;
     this._pendingCandidates = [];
+    this._answerPending = false;
     this._pendingMessages = [];
     this._stopHeartbeat();
   }
@@ -260,10 +264,23 @@ export class WebRTCManager {
 
   /** Initiator: consume the remote answer. */
   async handleAnswer(sdp) {
-    if (!this.pc) return;
-    await this.pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    this._remoteDescSet = true;
-    await this._drainPendingCandidates();
+    const pc = this.pc;
+    if (!pc) return;
+    if (pc.signalingState !== "have-local-offer" || this._answerPending) {
+      console.warn(
+        `[webrtc] Skipping remote description, state is: ${pc.signalingState}`,
+      );
+      return;
+    }
+    this._answerPending = true;
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      if (this.pc !== pc) return;
+      this._remoteDescSet = true;
+      await this._drainPendingCandidates();
+    } finally {
+      if (this.pc === pc) this._answerPending = false;
+    }
   }
 
   /** Trickle ICE in — buffered until the remote description exists. */
@@ -369,10 +386,20 @@ export class WebRTCManager {
   async _handlePacket(raw) {
     let packet;
     try {
-      packet = JSON.parse(raw);
-    } catch {
-      return; // non-JSON frame — ignore
+      ({ packet } = await openPacket(raw));
+    } catch (error) {
+      console.warn(
+        "[webrtc] incoming data-channel packet rejected:",
+        error?.name || error?.message,
+      );
+      return false;
     }
+    return this._handleDecodedPacket(packet);
+  }
+
+  /** @private Route an already authenticated/decoded packet. */
+  async _handleDecodedPacket(packet) {
+    if (!packet || typeof packet !== "object" || Array.isArray(packet)) return false;
     if (!PACKET_TYPES.has(packet.type)) return;
 
     if (packet.type === "ping") {
@@ -404,6 +431,7 @@ export class WebRTCManager {
     });
 
     if (packet.type === "chat") this.onChatMessage?.(entry);
+    return true;
   }
 
   /**

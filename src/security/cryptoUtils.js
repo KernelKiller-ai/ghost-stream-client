@@ -85,7 +85,7 @@ export class EphemeralCrypto {
   /**
    * Step 2a (initiator completes first): mix the peer's public key in
    * and derive the shared AES-GCM session key.
-   * @param {ArrayBuffer} peerPublicKey raw ECDH public key from the peer
+   * @param {ArrayBuffer|Uint8Array} peerPublicKey raw ECDH public key from the peer
    */
   async completeHandshake(peerPublicKey) {
     const subtle = requireSubtle();
@@ -224,9 +224,27 @@ export async function sealPacket(packet) {
  */
 export async function openPacket(wire) {
   const frame = JSON.parse(wire);
-  if (frame.e !== 1) return { packet: frame.p, encrypted: false };
-  const plaintext = await sessionCrypto.decrypt(frame);
-  return { packet: JSON.parse(plaintext), encrypted: true };
+  if (!frame || typeof frame !== "object") {
+    throw new TypeError("invalid data-channel packet");
+  }
+  if (frame.e === 1) {
+    const plaintext = await sessionCrypto.decrypt(frame);
+    return { packet: JSON.parse(plaintext), encrypted: true };
+  }
+  return {
+    packet: Object.hasOwn(frame, "p") ? frame.p : frame,
+    encrypted: false,
+  };
+}
+
+/** Decode a standard Base64 string to bytes (used for ECDH public keys). */
+export function fromB64(str) {
+  return Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
+}
+
+/** Encode bytes as standard Base64 (used for ECDH public keys). */
+export function toB64(arr) {
+  return btoa(String.fromCharCode(...arr));
 }
 
 /* ---------------- base64url helpers ---------------- */
