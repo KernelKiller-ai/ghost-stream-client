@@ -103,7 +103,9 @@ export function applyAudioState(stream, enabled) {
 export function applyVideoState(stream, enabled) {
   if (!stream) return;
   for (const track of stream.getVideoTracks()) {
-    track.enabled = Boolean(enabled);
+    if (enabled) continue;
+    stream.removeTrack(track);
+    track.stop();
   }
 }
 

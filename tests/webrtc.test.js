@@ -82,6 +82,27 @@ class FakeRTCPeerConnection {
   }
   addTrack(track, stream) {
     this._localTracks.push(track);
+    const sender = {
+      track,
+      replaceTrack: async (nextTrack) => {
+        sender.track = nextTrack;
+      },
+    };
+    (this._senders ||= []).push(sender);
+    return sender;
+  }
+  getSenders() {
+    return this._senders || [];
+  }
+  addTransceiver(kind) {
+    const sender = {
+      track: null,
+      replaceTrack: async (nextTrack) => {
+        sender.track = nextTrack;
+      },
+    };
+    (this._senders ||= []).push(sender);
+    return { sender, receiver: { track: new FakeTrack(kind) } };
   }
   createDataChannel(label, opts) {
     this._createdChannel = new FakeDataChannel(label, opts);
@@ -148,6 +169,7 @@ class FakeDataChannel {
     this.onclose?.();
   }
 }
+const packetBody = (frame) => frame?.p || frame;
 class FakeRTCSolution {}
 globalThis.RTCPeerConnection = FakeRTCPeerConnection;
 globalThis.RTCSessionDescription = class {
@@ -279,6 +301,14 @@ check(
   "B picked up data channel from offer",
   managerB.dataChannel?.label === "ephemeral-chat" && managerB.dataChannel?.ordered === true,
 );
+const reservedVideoSender = managerB.pc.getSenders().find((sender) => sender.track === null);
+managerB.attachLocalStream(localB);
+await new Promise((resolve) => setTimeout(resolve, 0));
+check(
+  "late local camera attaches to reserved sender",
+  reservedVideoSender?.track === localB.getTracks().find((track) => track.kind === "video") &&
+    managerB.pc.getSenders().filter((sender) => sender.track?.kind === "video").length === 1,
+);
 check(
   "B drains early ICE after remote description",
   managerB.pc._iceAdded === 1 && managerB._pendingCandidates.length === 0,
@@ -332,7 +362,28 @@ check(
     managerB.remoteStream.getTracks().length >= 1,
 );
 
+const originalVideoTrack = localA.getTracks().find((track) => track.kind === "video");
+const videoSender = managerA.pc.getSenders().find((sender) => sender.track?.kind === "video");
+await managerA.setLocalVideoTrack(null);
+check(
+  "camera sender can be detached without renegotiation",
+  Boolean(videoSender) && videoSender.track === null,
+);
+const replacementVideoTrack = new FakeTrack("video");
+await managerA.setLocalVideoTrack(replacementVideoTrack);
+check(
+  "camera sender accepts replacement track without renegotiation",
+  videoSender.track === replacementVideoTrack &&
+    originalVideoTrack.readyState === "live",
+);
+
 /* ---------------- data channel chat ---------------- */
+const cryptoPeer = new EphemeralCrypto();
+const managerKey = (await sessionCrypto.beginHandshake()).publicKey;
+const cryptoPeerKey = (await cryptoPeer.beginHandshake()).publicKey;
+await sessionCrypto.completeHandshake(cryptoPeerKey);
+await cryptoPeer.completeHandshake(managerKey);
+
 // Queue while connecting, then flush when the data channel opens.
 const queuedOk = await managerA.sendMessage("queued text", { sender: "AAAA" });
 check(
@@ -343,12 +394,13 @@ managerA.dataChannel.open();
 await new Promise((r) => setTimeout(r, 10));
 check(
   "presence packet on channel open",
-  managerA.dataChannel.sent[0]?.type === "presence",
+  packetBody(managerA.dataChannel.sent[0])?.type === "presence" &&
+    managerA.dataChannel.sent[0]?.e === 0,
 );
 check(
   "queued message flushed on channel open",
   managerA.dataChannel.sent.some(
-    (p) => p.type === "chat" && p.text === "queued text",
+    (p) => p.e === 1,
   ) && managerA._pendingMessages.length === 0,
 );
 
@@ -358,7 +410,7 @@ check(
   "sendMessage over ephemeral channel",
   sentOk === true &&
     managerA.dataChannel.sent.some(
-      (p) => p.type === "chat" && p.text === "ghost text",
+      (p) => p.e === 1,
     ),
 );
 check(
@@ -369,12 +421,9 @@ check(
 );
 
 // B receives the same packet through its channel
-const wirePacket = managerA.dataChannel.sent.find(
-  (p) => p.type === "chat" && p.text === "ghost text",
-);
+const wirePacket = managerA.dataChannel.sent.filter((p) => p.e === 1).at(-1);
 managerB.dataChannel.readyState = "open";
-managerB.dataChannel.onmessage({ data: JSON.stringify(wirePacket) });
-await new Promise((r) => setTimeout(r, 0));
+await managerB._handlePacket(JSON.stringify(wirePacket));
 check(
   "remote packet routed into volatileBuffer",
   volatileBuffer
@@ -391,7 +440,9 @@ const fallbackSent = await managerA.sendMessage("fallback text", {
   encryption: "plaintext-fallback",
 });
 const fallbackPacket = managerA.dataChannel.sent.find(
-  (packet) => packet.type === "chat" && packet.text === "fallback text",
+  (packet) =>
+    packetBody(packet)?.type === "chat" &&
+    packetBody(packet)?.text === "fallback text",
 );
 managerB.dataChannel.onmessage({ data: JSON.stringify(fallbackPacket) });
 await new Promise((r) => setTimeout(r, 0));
@@ -416,11 +467,17 @@ check(
 );
 
 // Heartbeats use a data-channel echo; this is RTT, not physical range.
-const ping = managerA.dataChannel.sent.find((packet) => packet.type === "ping");
+const ping = managerA.dataChannel.sent.find(
+  (packet) => packetBody(packet)?.type === "ping",
+);
+check("heartbeat ping is sent in plaintext envelope", ping?.e === 0);
 await managerB._handlePacket(JSON.stringify(ping));
 const pong = managerB.dataChannel.sent.find(
-  (packet) => packet.type === "pong" && packet.pingId === ping?.pingId,
+  (packet) =>
+    packetBody(packet)?.type === "pong" &&
+    packetBody(packet)?.pingId === packetBody(ping)?.pingId,
 );
+check("heartbeat pong is sent in plaintext envelope", pong?.e === 0);
 await managerA._handlePacket(JSON.stringify(pong));
 check(
   "data-channel ping/pong reports RTT",
@@ -455,6 +512,7 @@ check(
 );
 sessionCrypto.zeroize();
 senderCrypto.zeroize();
+cryptoPeer.zeroize();
 
 // channel closed -> sendPacket returns false
 managerA.dataChannel.close();

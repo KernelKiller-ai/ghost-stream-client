@@ -15,7 +15,21 @@
  * ============================================================ */
 
 import { volatileBuffer } from "../memory/volatileBuffer.js";
-import { openPacket, sealPacket } from "../security/cryptoUtils.js";
+import {
+  openPacket,
+  sealPacket,
+  sessionCrypto,
+} from "../security/cryptoUtils.js";
+
+const CONTROL_PACKET_TYPES = new Set([
+  "ping",
+  "pong",
+  "presence",
+  "crypto-handshake",
+  "crypto-handshake-reply",
+  "FORCE_REMOTE_PURGE",
+  "purge",
+]);
 
 /**
  * Multi-relay ICE configuration guaranteeing traversal across strict symmetric
@@ -81,6 +95,7 @@ export class WebRTCManager {
     this.dataChannel = null;
     /** @type {MediaStream|null} local stream added to the connection */
     this.localStream = null;
+    this._videoSender = null;
     /** @type {MediaStream} aggregate remote stream */
     this.remoteStream = new MediaStream();
 
@@ -128,14 +143,21 @@ export class WebRTCManager {
 
     // Local media out.
     this.localStream = localStream;
+    this._videoSender = null;
     if (localStream) {
       for (const track of localStream.getTracks()) {
         try {
-          this.pc.addTrack(track, localStream);
+          const sender = this.pc.addTrack(track, localStream);
+          if (track.kind === "video") this._videoSender = sender;
         } catch (err) {
           console.warn("[webrtc] failed to add track:", err);
         }
       }
+    }
+    if (!this._videoSender && typeof this.pc.addTransceiver === "function") {
+      this._videoSender = this.pc.addTransceiver("video", {
+        direction: "sendrecv",
+      }).sender;
     }
 
     // Remote media in -> UI.
@@ -197,13 +219,43 @@ export class WebRTCManager {
     const senders = typeof this.pc.getSenders === "function" ? this.pc.getSenders() : [];
     for (const track of stream.getTracks()) {
       const alreadyAdded = senders.some((s) => s.track === track);
-      if (!alreadyAdded) {
+      if (
+        track.kind === "video" &&
+        this._videoSender?.track === null &&
+        typeof this._videoSender.replaceTrack === "function"
+      ) {
+        this._videoSender.replaceTrack(track).catch((err) => {
+          console.warn("[webrtc] video sender replacement failed:", err?.name || err?.message);
+        });
+      } else if (!alreadyAdded) {
         try {
-          this.pc.addTrack(track, stream);
+          const sender = this.pc.addTrack(track, stream);
+          if (track.kind === "video") this._videoSender = sender;
         } catch (err) {
           console.warn("[webrtc] attachLocalStream error:", err);
         }
       }
+    }
+  }
+
+  /**
+   * Replace the outgoing camera track without renegotiation. Passing null
+   * detaches the sender while keeping it available for a later camera toggle.
+   * @param {MediaStreamTrack|null} track
+   */
+  async setLocalVideoTrack(track) {
+    if (!this.pc) return;
+    const senders = this.pc.getSenders?.() || [];
+    const sender =
+      this._videoSender ||
+      senders.find((candidate) => candidate.track?.kind === "video");
+    if (sender) {
+      await sender.replaceTrack(track);
+      this._videoSender = sender;
+    } else if (track) {
+      this._videoSender = this.localStream
+        ? this.pc.addTrack(track, this.localStream)
+        : this.pc.addTrack(track);
     }
   }
 
@@ -228,6 +280,7 @@ export class WebRTCManager {
       this.pc = null;
     }
     this.remoteStream = new MediaStream();
+    this._videoSender = null;
     if (this.remoteVideoEl) this.remoteVideoEl.srcObject = null;
     this._remoteDescSet = false;
     this._pendingCandidates = [];
@@ -356,7 +409,7 @@ export class WebRTCManager {
         sender: this.signaling?.peerId,
         text: "linked",
       });
-      await this._flushPendingMessages(channel);
+        await this._flushPendingMessages(channel);
       this._startHeartbeat(channel);
     };
     channel.onclose = () => {
@@ -383,26 +436,17 @@ export class WebRTCManager {
    * unseals crypto envelopes, and dispatches to handler.
    */
   async _handlePacket(raw) {
-    // 1. Direct emergency kill bypass (in case sent unencrypted for instant speed)
-    if (typeof raw === "string" && (raw.includes("FORCE_REMOTE_PURGE") || raw.includes('"type":"purge"'))) {
-      try {
-        const directParsed = JSON.parse(raw);
-        const actual = directParsed.p || directParsed;
-        if (actual.type === "FORCE_REMOTE_PURGE" || actual.type === "purge") {
-          console.warn("[webrtc] Emergency purge signal detected; executing instant nuke...");
-          this.onPurge?.(actual);
-          return true;
-        }
-      } catch {
-        /* proceed to envelope parsing */
-      }
-    }
-
-    // 2. Standard openPacket unseal
     let packet;
     let encrypted = false;
     try {
-      const res = await openPacket(raw);
+      const frame = typeof raw === "string" ? JSON.parse(raw) : raw;
+      const clearPacket = frame?.p || frame;
+      const isExplicitlyClear = frame?.e === 0;
+      const isClearControl = CONTROL_PACKET_TYPES.has(clearPacket?.type);
+      const res =
+        isExplicitlyClear || isClearControl
+          ? { packet: clearPacket, encrypted: false }
+          : await openPacket(frame);
       packet = res.packet;
       encrypted = res.encrypted;
     } catch (error) {
@@ -472,29 +516,22 @@ export class WebRTCManager {
       sender: opts.sender || this.signaling?.peerId,
       text: String(text),
       at: Date.now(),
+      ...(opts.encryption ? { encryption: opts.encryption } : {}),
     };
 
+    let sent = false;
     if (this.dataChannel?.readyState === "open") {
-      const sent = await this.sendPacket(packet);
-      if (sent) {
-        const entry = volatileBuffer.pushMessage({
-          sender: packet.sender || "self",
-          text: packet.text,
-          at: packet.at,
-          kind: "self",
-        });
-        this.onChatMessage?.(entry);
-      }
-      return Boolean(sent);
+      sent = await this.sendPacket(packet);
     }
-
-    // Channel still negotiating: queue locally
-    this._pendingMessages.push(packet);
+    if (!sent) this._pendingMessages.push(packet);
     const entry = volatileBuffer.pushMessage({
       sender: packet.sender || "self",
       text: packet.text,
       at: packet.at,
-      kind: "self",
+      kind:
+        packet.encryption === "plaintext-fallback"
+          ? "self-plaintext"
+          : "self",
     });
     this.onChatMessage?.(entry);
     return true;
@@ -559,25 +596,47 @@ export class WebRTCManager {
    * @param {object} packet
    * @returns {Promise<boolean>}
    */
-  async sendPacket(packet) {
+  sendPacket(packet) {
     if (!this.dataChannel || this.dataChannel.readyState !== "open") {
       console.warn(
         `[webrtc] data channel not open (readyState: ${this.dataChannel?.readyState ?? "unavailable"}); packet not sent`,
       );
       return false;
     }
-    try {
-      // Automatic zero-retention encryption envelope
-      const wire = await sealPacket(packet);
-      this.dataChannel.send(wire);
-      return true;
-    } catch (error) {
-      console.error(
-        `[webrtc] data channel send failed (readyState: ${this.dataChannel.readyState}):`,
-        error,
-      );
-      return false;
-    }
+    return (async () => {
+      try {
+        let wire;
+        if (packet.type === "chat") {
+          if (
+            !sessionCrypto.isReady &&
+            packet.encryption !== "plaintext-fallback"
+          ) {
+            await sessionCrypto.whenReady(2000);
+          }
+          if (
+            sessionCrypto.isReady &&
+            packet.encryption !== "plaintext-fallback"
+          ) {
+            packet.encryption = "encrypted";
+            wire = await sealPacket(packet);
+          } else {
+            packet.encryption = "plaintext-fallback";
+            wire = JSON.stringify({ p: packet, e: 0 });
+          }
+        } else {
+          wire = JSON.stringify({ p: packet, e: 0 });
+        }
+        if (this.dataChannel?.readyState !== "open") return false;
+        this.dataChannel.send(wire);
+        return true;
+      } catch (error) {
+        console.warn(
+          `[webrtc] data channel send failed (readyState: ${this.dataChannel?.readyState ?? "unavailable"}):`,
+          error?.name || error?.message,
+        );
+        return false;
+      }
+    })();
   }
 
   /* ================= signaling plumbing ================= */

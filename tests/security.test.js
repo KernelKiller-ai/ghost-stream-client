@@ -97,6 +97,19 @@ await peer.completeHandshake(sgPub);
 
 const wire = await sealPacket({ type: "chat", text: "secret" });
 check("sealed wire hides plaintext", !wire.includes("secret") && JSON.parse(wire).e === 1);
+const controlWire = await sealPacket({ type: "ping", pingId: "test" });
+check(
+  "control frames remain plaintext with a clear envelope",
+  JSON.parse(controlWire).e === 0,
+);
+const clearPing = await openPacket(JSON.stringify({
+  e: 1,
+  p: { type: "ping", pingId: "wrapped-test" },
+}));
+check(
+  "wrapped heartbeat control skips decryption",
+  clearPing.packet.pingId === "wrapped-test" && !clearPing.encrypted,
+);
 // The peer side of the singleton handshake can decrypt the same frame:
 const recovered = JSON.parse(await peer.decrypt(JSON.parse(wire)));
 check("peer decrypts sealed packet", recovered.text === "secret");

@@ -18,7 +18,6 @@ import * as autoPurge from "./memory/autoPurge.js";
 import { stopSession } from "./memory/autoPurge.js";
 import {
   sessionCrypto,
-  sealPacket,
   openPacket,
   fromB64,
   toB64,
@@ -291,66 +290,11 @@ const rtc = new WebRTCManager({
   },
 });
 
-// --- E2E crypto: route all data-channel packets through AES-GCM sealing ---
-rtc.sendPacket = async function (packet) {
-  const channel = this.dataChannel;
-  if (!channel || channel.readyState !== "open") {
-    console.warn(
-      `[webrtc] data channel not open (readyState: ${channel?.readyState ?? "unavailable"}); packet not sent`,
-    );
-    return false;
-  }
-  try {
-    const isHandshake =
-      packet.type === "crypto-handshake" ||
-      packet.type === "crypto-handshake-reply";
-    let wire;
-    if (isHandshake) {
-      wire = JSON.stringify({ p: packet, e: 0 });
-    } else {
-      if (
-        packet.type === "chat" &&
-        !sessionCrypto.isReady &&
-        packet.encryption !== "plaintext-fallback"
-      ) {
-        await sessionCrypto.whenReady(2000);
-      }
-
-      if (packet.type === "chat" && !sessionCrypto.isReady) {
-        packet.encryption = "plaintext-fallback";
-        wire = JSON.stringify({ p: packet, e: 0 });
-        console.warn(
-          "[webrtc] sending chat without end-to-end encryption; marked UNENCRYPTED",
-        );
-        chat.system(
-          "UNENCRYPTED FALLBACK — peer link is open; this message is not end-to-end encrypted",
-        );
-      } else {
-        if (packet.type === "chat") packet.encryption = "encrypted";
-        wire = await sealPacket(packet);
-      }
-    }
-    if (channel.readyState !== "open") {
-      console.warn(
-        `[webrtc] data channel closed during encryption (readyState: ${channel.readyState}); packet not sent`,
-      );
-      return false;
-    }
-    channel.send(wire);
-    return true;
-  } catch (error) {
-    console.error(
-      `[webrtc] encrypted data channel send failed (readyState: ${channel.readyState}):`,
-      error,
-    );
-    return false;
-  }
-};
 rtc._handlePacket = async function (wire) {
   try {
     const { packet, encrypted } = await openPacket(wire);
     if (!packet || typeof packet !== "object" || Array.isArray(packet)) return;
-    if (packet?.type === "FORCE_REMOTE_PURGE") {
+    if (packet.type === "FORCE_REMOTE_PURGE" || packet.type === "purge") {
       console.warn("[webrtc] EMERGENCY FORCE_REMOTE_PURGE received from peer");
       executePanic(true);
       return;
@@ -372,9 +316,13 @@ rtc._handlePacket = async function (wire) {
     if (packet.type === "crypto-handshake-reply") {
       return handleCryptoHandshakeReply(packet);
     }
-    return WebRTCManager.prototype._handleDecodedPacket.call(this, packet);
+    return WebRTCManager.prototype._handleDecodedPacket.call(
+      this,
+      packet,
+      encrypted,
+    );
   } catch (error) {
-    console.error("[webrtc] incoming encrypted packet rejected:", error);
+    console.warn("[webrtc] incoming data-channel packet rejected:", error);
   }
 };
 
@@ -510,6 +458,9 @@ function hideInviteModal() {
   inviteCountdownTimer = null;
   inviteExpiresAt = 0;
   els.inviteQr?.replaceChildren();
+  if (els.inviteModal?.contains(document.activeElement)) {
+    document.activeElement?.blur();
+  }
   els.inviteModal?.classList.add("hidden");
   els.inviteModal?.setAttribute("aria-hidden", "true");
 }
@@ -737,16 +688,66 @@ async function handleSendMessage(text) {
   }
 }
 
-/** TOGGLE MEDIA — mic mute / camera disable, reflected on the dock. */
-function handleToggleMedia(kind) {
-  const enabled = kind === "audio" ? media.toggleMute() : media.toggleCamera();
+/** TOGGLE MEDIA — mic mute / hardware-releasing camera control. */
+async function handleToggleMedia(kind) {
+  let enabled;
+  if (kind === "audio") {
+    enabled = media.toggleMute();
+  } else {
+    enabled = !media.videoEnabled;
+    try {
+      if (enabled) {
+        const cameraStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        });
+        const [track] = cameraStream.getVideoTracks();
+        if (!track) throw new Error("camera did not provide a video track");
 
+        if (!media.stream) media.stream = new MediaStream();
+        media.stream.addTrack(track);
+        media.mode = media.stream.getAudioTracks().length ? "full" : "video-only";
+        await rtc.setLocalVideoTrack(track);
+        els.videoLocal.srcObject = media.stream;
+        els.videoLocal.play?.().catch(() => {});
+      } else {
+        const tracks = media.stream?.getVideoTracks() || [];
+        let detachError = null;
+        try {
+          await rtc.setLocalVideoTrack(null);
+        } catch (error) {
+          detachError = error;
+        } finally {
+          for (const track of tracks) {
+            media.stream?.removeTrack(track);
+            track.stop();
+          }
+        }
+        if (els.videoLocal) els.videoLocal.srcObject = null;
+        if (media.stream?.getAudioTracks().length) {
+          media.mode = "audio-only";
+        } else {
+          media.stream = null;
+          media.mode = "none";
+        }
+        if (detachError) throw detachError;
+      }
+    } catch (error) {
+      console.warn("[app] camera toggle failed:", error?.name || error?.message);
+      chat.system(`camera ${enabled ? "could not start" : "could not stop"}: ${error.message}`);
+      enabled = media.videoEnabled;
+    }
+    const localPip = els.videoLocal.closest(".video-pip");
+    localPip?.classList.add("has-media");
+    localPip?.classList.toggle("has-video", enabled);
+    els.btnVideo.disabled = false;
+  }
   const btn = kind === "audio" ? els.btnAudio : els.btnVideo;
   const stateEl = kind === "audio" ? els.audioState : els.videoState;
   renderMediaToggle(btn, stateEl, enabled);
 
   // Inform the peer over the data channel (it will see the tracks go dark).
-  rtc.sendPacket({
+  void rtc.sendPacket({
     type: "media-state",
     sender: signaling.peerId,
     text:
@@ -871,9 +872,14 @@ async function handleCryptoHandshakeReply(packet) {
 /** Acquire mic/cam, bind to the local PiP element, keep controls live. */
 async function setupLocalMedia() {
   const result = await media.acquire();
-  els.videoLocal.closest(".video-pip")?.classList.toggle("has-media", Boolean(result.stream));
+  const hasVideo = Boolean(
+    result.stream?.getVideoTracks().some((track) => track.readyState === "live"),
+  );
+  const localPip = els.videoLocal.closest(".video-pip");
+  localPip?.classList.add("has-media");
+  localPip?.classList.toggle("has-video", hasVideo);
   if (result.stream) {
-    els.videoLocal.srcObject = result.stream;
+    els.videoLocal.srcObject = hasVideo ? result.stream : null;
     els.btnAudio.disabled = els.btnVideo.disabled = false;
     // Bind stream into the active RTCPeerConnection
     if (rtc.pc) rtc.attachLocalStream(result.stream);

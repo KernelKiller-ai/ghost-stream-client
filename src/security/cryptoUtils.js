@@ -44,6 +44,15 @@ function randomBytes(n) {
  * ============================================================ */
 
 const CHUNK_SIZE = 0x8000;
+const PLAINTEXT_CONTROL_TYPES = new Set([
+  "ping",
+  "pong",
+  "presence",
+  "crypto-handshake",
+  "crypto-handshake-reply",
+  "FORCE_REMOTE_PURGE",
+  "purge",
+]);
 
 /** Decode standard or URL-safe Base64 string to Uint8Array safely. */
 export function fromB64(str) {
@@ -270,8 +279,15 @@ export const sessionCrypto = new EphemeralCrypto();
  * @returns {Promise<string>} wire string: {"e":1,"iv":..,"ct":..} or plain JSON
  */
 export async function sealPacket(packet) {
-  if (!sessionCrypto.isReady) {
+  if (packet?.type !== "chat") {
     return JSON.stringify({ p: packet, e: 0 });
+  }
+  if (!sessionCrypto.isReady) {
+    const fallbackPacket = {
+      ...packet,
+      encryption: packet.encryption || "plaintext-fallback",
+    };
+    return JSON.stringify({ p: fallbackPacket, e: 0 });
   }
   const env = await sessionCrypto.encrypt(JSON.stringify(packet));
   return JSON.stringify({ e: 1, ...env });
@@ -286,6 +302,12 @@ export async function openPacket(wire) {
   const frame = typeof wire === "string" ? JSON.parse(wire) : wire;
   if (!frame || typeof frame !== "object") {
     throw new TypeError("invalid data-channel packet");
+  }
+
+  const clearPacket = Object.hasOwn(frame, "p") ? frame.p : frame;
+  const type = clearPacket?.type;
+  if (frame.e === 0 || PLAINTEXT_CONTROL_TYPES.has(type)) {
+    return { packet: clearPacket, encrypted: false };
   }
 
   if (frame.e === 1 || (frame.iv && (frame.ct || frame.data))) {

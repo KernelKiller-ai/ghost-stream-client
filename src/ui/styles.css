@@ -629,11 +629,11 @@ input:focus-visible {
   transform: scaleX(-1);
 }
 
-.video-pip.has-media video {
+.video-pip.has-video video {
   display: block;
 }
 
-.video-pip.has-media .pip-placeholder {
+.video-pip.has-video .pip-placeholder {
   display: none;
 }
 
