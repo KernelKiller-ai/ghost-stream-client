@@ -222,26 +222,42 @@ export class EphemeralCrypto {
   /**
    * Decrypt an envelope produced by encrypt().
    * Supports both envelope models (iv/ct and iv/data).
+   * Gracefully guards against uninitialized/destroyed keys and throws descriptive errors.
    * @param {{ iv: string, ct?: string, data?: string, v?: number }} envelope
    * @returns {Promise<string>} plaintext
    */
   async decrypt(envelope) {
-    if (!this.isReady) throw new Error("session key not ready or destroyed");
-    if (!envelope || !envelope.iv) throw new Error("malformed encrypted envelope");
+    if (this._destroyed) {
+      throw new Error("Cannot decrypt: session key has been zeroized or destroyed");
+    }
+    if (!this._sessionKey || !this.isReady) {
+      throw new Error("Cannot decrypt: session key not initialized (ECDH key exchange incomplete)");
+    }
+    if (!envelope || typeof envelope !== "object" || !envelope.iv) {
+      throw new Error("Cannot decrypt: malformed encrypted envelope (missing IV)");
+    }
 
     const subtle = requireSubtle();
     const iv = fromB64(envelope.iv);
     const ciphertextRaw = envelope.ct || envelope.data;
 
-    if (!ciphertextRaw) throw new Error("missing ciphertext payload");
+    if (!ciphertextRaw) {
+      throw new Error("Cannot decrypt: missing ciphertext payload in envelope");
+    }
     const ct = fromB64(ciphertextRaw);
 
-    const pt = await subtle.decrypt(
-      { name: "AES-GCM", iv },
-      this._sessionKey,
-      ct,
-    );
-    return new TextDecoder().decode(pt);
+    try {
+      const pt = await subtle.decrypt(
+        { name: "AES-GCM", iv },
+        this._sessionKey,
+        ct,
+      );
+      return new TextDecoder().decode(pt);
+    } catch (err) {
+      throw new Error(
+        `Decryption failed (integrity check failed, tampered payload, or key mismatch): ${err?.message || err?.name || "OperationError"}`,
+      );
+    }
   }
 
   /* ---------------- zeroization ---------------- */
@@ -279,7 +295,11 @@ export const sessionCrypto = new EphemeralCrypto();
  * @returns {Promise<string>} wire string: {"e":1,"iv":..,"ct":..} or plain JSON
  */
 export async function sealPacket(packet) {
-  if (packet?.type !== "chat") {
+  if (
+    packet?.type === "crypto-handshake" ||
+    packet?.type === "crypto-handshake-reply" ||
+    packet?.type !== "chat"
+  ) {
     return JSON.stringify({ p: packet, e: 0 });
   }
   if (!sessionCrypto.isReady) {
@@ -295,6 +315,7 @@ export async function sealPacket(packet) {
 
 /**
  * Unseal an incoming wire string produced by sealPacket().
+ * Awaits sessionCrypto.whenReady(3000) for encrypted chat packets to eliminate ECDH race conditions.
  * @param {string|object} wire
  * @returns {Promise<{ packet: object, encrypted: boolean }>}
  */
@@ -306,11 +327,20 @@ export async function openPacket(wire) {
 
   const clearPacket = Object.hasOwn(frame, "p") ? frame.p : frame;
   const type = clearPacket?.type;
-  if (frame.e === 0 || PLAINTEXT_CONTROL_TYPES.has(type)) {
+  if (
+    frame.e === 0 ||
+    type === "crypto-handshake" ||
+    type === "crypto-handshake-reply" ||
+    PLAINTEXT_CONTROL_TYPES.has(type)
+  ) {
     return { packet: clearPacket, encrypted: false };
   }
 
   if (frame.e === 1 || (frame.iv && (frame.ct || frame.data))) {
+    // Wait for ECDH session key agreement if in-flight to prevent race condition
+    if (!sessionCrypto.isReady) {
+      await sessionCrypto.whenReady(3000);
+    }
     const plaintext = await sessionCrypto.decrypt(frame);
     return { packet: JSON.parse(plaintext), encrypted: true };
   }

@@ -523,6 +523,17 @@ export class WebRTCManager {
       const clearPacket = frame?.p || frame;
       const isExplicitlyClear = frame?.e === 0;
       const isClearControl = CONTROL_PACKET_TYPES.has(clearPacket?.type);
+
+      // Incoming encrypted packets wait for sessionCrypto.whenReady(3000) so initial message doesn't crash with OperationError
+      const isEncrypted =
+        !isExplicitlyClear &&
+        !isClearControl &&
+        (frame?.e === 1 || Boolean(frame?.iv && (frame?.ct || frame?.data)));
+
+      if (isEncrypted && !sessionCrypto.isReady) {
+        await sessionCrypto.whenReady(3000);
+      }
+
       const res =
         isExplicitlyClear || isClearControl
           ? { packet: clearPacket, encrypted: false }
@@ -721,7 +732,15 @@ export class WebRTCManager {
     return (async () => {
       try {
         let wire;
-        if (packet.type === "chat") {
+        const isHandshake =
+          packet.type === "crypto-handshake" ||
+          packet.type === "crypto-handshake-reply";
+        const isControl = isHandshake || CONTROL_PACKET_TYPES.has(packet.type);
+
+        if (isHandshake || isControl || packet.type !== "chat") {
+          // ALWAYS transmit crypto-handshake and crypto-handshake-reply as cleartext control frames
+          wire = JSON.stringify({ p: packet, e: 0 });
+        } else if (packet.type === "chat") {
           if (
             !sessionCrypto.isReady &&
             packet.encryption !== "plaintext-fallback"

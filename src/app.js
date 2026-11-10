@@ -304,6 +304,35 @@ const rtc = new WebRTCManager({
 
 rtc._handlePacket = async function (wire) {
   try {
+    let rawFrame = null;
+    let candidate = null;
+    try {
+      rawFrame = typeof wire === "string" ? JSON.parse(wire) : wire;
+      candidate = rawFrame?.p || rawFrame;
+    } catch {}
+
+    if (candidate?.type === "FORCE_REMOTE_PURGE" || candidate?.type === "purge") {
+      console.warn("[webrtc] EMERGENCY FORCE_REMOTE_PURGE received from peer");
+      executePanic(true);
+      return;
+    }
+
+    // Intercept cleartext handshake control frames immediately before unsealing
+    if (candidate?.type === "crypto-handshake") {
+      return handleCryptoHandshake(candidate);
+    }
+    if (candidate?.type === "crypto-handshake-reply") {
+      return handleCryptoHandshakeReply(candidate);
+    }
+
+    // Await sessionCrypto.whenReady(3000) for incoming encrypted frames before unsealing
+    const isEncryptedFrame =
+      rawFrame?.e === 1 ||
+      Boolean(rawFrame?.iv && (rawFrame?.ct || rawFrame?.data));
+    if (isEncryptedFrame && !sessionCrypto.isReady) {
+      await sessionCrypto.whenReady(3000);
+    }
+
     const { packet, encrypted } = await openPacket(wire);
     if (!packet || typeof packet !== "object" || Array.isArray(packet)) return;
     if (packet.type === "FORCE_REMOTE_PURGE" || packet.type === "purge") {
