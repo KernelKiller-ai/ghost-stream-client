@@ -574,3 +574,291 @@ export function renderObliteratedScreen() {
     console.error("[renderView] renderObliteratedScreen error:", err);
   }
 }
+
+/* ============================================================
+ * GHOST-STREAM // BLE Radar (offline Bluetooth proximity UI)
+ * Glassmorphic scan overlay + top-nav button controller.
+ *
+ * States: idle → scanning → pairing → connected | failed | cancelled
+ * Fully offline: invokes bluetoothManager.scanForPeers() directly;
+ * no network calls, no telemetry, nothing persisted.
+ * ============================================================ */
+
+import { scanForPeers, connectGatt, checkSupport, disconnect as bleDisconnect } from "../core/bluetoothManager.js";
+
+/** Canonical radar state machine values. */
+export const BLE_RADAR_STATES = {
+  IDLE: "Idle",
+  SCANNING: "Scanning",
+  PAIRING: "Pairing",
+  CONNECTED: "Connected",
+  FAILED: "Scan Failed",
+};
+
+/**
+ * Owns the radar button, the modal overlay and the state machine.
+ * Instantiated once by main.js with the room-header element for the
+ * connected peer readout.
+ */
+export class BleRadarView {
+  /**
+   * @param {HTMLButtonElement} btnEl top-nav "📡 BLE RADAR" button
+   * @param {HTMLElement} overlayEl full-viewport scan modal root
+   * @param {HTMLElement} [roomHeaderEl] room heading element that gains
+   *        the discovered peer badge once connected
+   */
+  constructor(btnEl, overlayEl, roomHeaderEl = null) {
+    this.btn = btnEl;
+    this.overlay = overlayEl;
+    this.roomHeader = roomHeaderEl;
+    this.state = BLE_RADAR_STATES.IDLE;
+    this.peerName = null;
+    this._scanAbort = null;
+    this._onClick = this._onClick.bind(this);
+    this.btn?.addEventListener("click", this._onClick);
+  }
+
+  /* ---------------- DOM construction ---------------- */
+
+  /** Build (once) and return the modal inner content. */
+  _ensureContent() {
+    if (this.panel) return this.panel;
+    this.overlay.innerHTML = `
+      <div class="radar-modal" role="dialog" aria-modal="true" aria-label="BLE Radar Scan">
+        <div class="radar-glass">
+          <div class="radar-scope" data-state="${this.state.toLowerCase().replace(/\s+/g, "-")}">
+            <div class="radar-ring radar-ring--1"></div>
+            <div class="radar-ring radar-ring--2"></div>
+            <div class="radar-ring radar-ring--3"></div>
+            <div class="radar-core"></div>
+            <div class="radar-sweep"></div>
+          </div>
+          <div class="radar-state-label" data-role="state">${this.state}</div>
+          <div class="radar-hint" data-role="hint">Tap a device in the chooser to pair</div>
+          <div class="radar-peer" data-role="peer"></div>
+          <button class="radar-close" data-role="close" type="button">ABORT SCAN</button>
+        </div>
+      </div>`;
+    this.panel = this.overlay.querySelector(".radar-glass");
+    this.scopeEl = this.overlay.querySelector(".radar-scope");
+    this.stateEl = this.overlay.querySelector('[data-role="state"]');
+    this.hintEl = this.overlay.querySelector('[data-role="hint"]');
+    this.peerEl = this.overlay.querySelector('[data-role="peer"]');
+    this.closeEl = this.overlay.querySelector('[data-role="close"]');
+    this.closeEl.addEventListener("click", () => this._close(true));
+    return this.panel;
+  }
+
+  /* ---------------- State machine ---------------- */
+
+  setState(next, hint = null) {
+    this.state = next;
+    if (this.stateEl) {
+      this.stateEl.textContent = next;
+      const key = next.toLowerCase().replace(/\s+/g, "-");
+      this.scopeEl?.setAttribute("data-state", key);
+      this.panel?.setAttribute("data-state", key);
+    }
+    if (hint && this.hintEl) this.hintEl.textContent = hint;
+    if (this.btn) {
+      this.btn.setAttribute("data-radar-state", next.toLowerCase().replace(/\s+/g, "-"));
+      this.btn.disabled = next === BLE_RADAR_STATES.PAIRING;
+      this.btn.textContent =
+        next === BLE_RADAR_STATES.CONNECTED && this.peerName
+          ? `📡 ${this.peerName}`
+          : next === BLE_RADAR_STATES.FAILED
+            ? "📡 RETRY RADAR"
+            : "📡 BLE RADAR";
+    }
+  }
+
+  /* ---------------- Interactions ---------------- */
+
+  async _onClick() {
+    if (this.state === BLE_RADAR_STATES.CONNECTED) {
+      // Click while connected tears the link down.
+      bleDisconnect();
+      this._clearPeerBadge();
+      this.setState(BLE_RADAR_STATES.IDLE, "Link released");
+      return;
+    }
+    await this.startScan();
+  }
+
+  /** Opens the overlay and runs scanForPeers → connectGatt. */
+  async startScan() {
+    const support = checkSupport();
+    if (!support.ok) {
+      this._open(BLE_RADAR_STATES.FAILED, support.hint);
+      return;
+    }
+
+    this._open(BLE_RADAR_STATES.SCANNING, "Pick a Ghost-Stream peer in the chooser…");
+    try {
+      const device = await scanForPeers();
+      this.setState(BLE_RADAR_STATES.PAIRING, `Handshaking with ${device.name ?? "peer"}…`);
+      this._renderPeer(device.name ?? "(unnamed peer)");
+      await connectGatt(device, {
+        onDisconnect: () => {
+          this._clearPeerBadge();
+          this.setState(BLE_RADAR_STATES.IDLE, "Link lost");
+          this._close();
+        },
+      });
+      this.peerName = device.name ?? "(unnamed peer)";
+      this._showPeerBadge(this.peerName);
+      this.setState(BLE_RADAR_STATES.CONNECTED, "GATT link established — offline signaling active");
+      setTimeout(() => this._close(), 1200);
+    } catch (err) {
+      const msg = String(err?.message ?? err);
+      if (msg === "BLE_SCAN_CANCELLED") {
+        this._close();
+        this.setState(BLE_RADAR_STATES.IDLE, "Scan dismissed");
+        return;
+      }
+      const friendly = {
+        BLE_CONNECT_UNREACHABLE: "Peer unreachable — moved out of range?",
+        BLE_PROFILE_MISSING: "Peer lacks the Ghost-Stream GATT profile (FFE0/FFE1)",
+        BLE_ACCESS_DENIED: "Pairing denied — approve the bond on the peer device",
+        BLE_NO_GATT_SERVER: "Device not bondable — try another peripheral",
+        BLE_NO_WRITABLE_CHAR: "Peer exposes no writable characteristic",
+      }[msg];
+      this._open(BLE_RADAR_STATES.FAILED, friendly ?? msg);
+    }
+  }
+
+  /* ---------------- Overlay + room badge ---------------- */
+
+  _open(state, hint) {
+    this._ensureContent();
+    this.overlay.classList.add("radar-overlay--active");
+    document.body.classList.add("radar-lock-scroll");
+    this.setState(state, hint);
+  }
+
+  /** @param {boolean} [cancelledByUser] treat as dismissal, not failure */
+  _close(cancelledByUser = false) {
+    if (this.state === BLE_RADAR_STATES.SCANNING && !cancelledByUser) {
+      this.setState(BLE_RADAR_STATES.FAILED);
+    }
+    this.overlay.classList.remove("radar-overlay--active");
+    document.body.classList.remove("radar-lock-scroll");
+  }
+
+  _renderPeer(name) {
+    if (this.peerEl) this.peerEl.textContent = name ? `▶ ${name}` : "";
+  }
+
+  /** Displays the discovered peer name in the active room header. */
+  _showPeerBadge(name) {
+    if (!this.roomHeader || !name) return;
+    if (!this._badge) {
+      this._badge = document.createElement("span");
+      this._badge.className = "room-heading-ble-peer";
+      this.roomHeader.appendChild(this._badge);
+    }
+    this._badge.textContent = `📡 ${name}`;
+  }
+
+  _clearPeerBadge() {
+    this._badge?.remove();
+    this._badge = null;
+    this.peerName = null;
+    if (this.peerEl) this.peerEl.textContent = "";
+  }
+
+  /** Full teardown (session purge). */
+  destroy() {
+    bleDisconnect();
+    this.btn?.removeEventListener("click", this._onClick);
+    this._clearPeerBadge();
+    this._close();
+    this.overlay.innerHTML = "";
+  }
+}
+
+/* ============================================================
+ * GHOST-STREAM // QR Answer Scanner UI (offline air-gapped handshake)
+ *
+ * Camera-backed scanner modal: reads the peer's animated QR frame
+ * sequence, reassembles + decompresses the SDP, hands it to
+ * webrtcManager.handleAnswer(), and kills the camera the instant
+ * the handshake completes (hardware LED off).
+ * ============================================================ */
+
+import { QrCameraScanner } from "../core/qrHandshake.js";
+
+/**
+ * Presentation wrapper around QrCameraScanner.
+ *
+ * @param {HTMLVideoElement|null} videoEl where the camera preview renders
+ * @param {HTMLElement|null} statusEl progress/status text element
+ */
+export class QrAnswerScannerView {
+  constructor(videoEl = null, statusEl = null) {
+    this.videoEl = videoEl;
+    this.statusEl = statusEl;
+    this.scanner = null;
+  }
+
+  _setStatus(text) {
+    if (this.statusEl) this.statusEl.textContent = text;
+  }
+
+  /**
+   * Launch the scanner and route the recovered SDP into WebRTC.
+   * @param {import("../core/webrtcManager.js").WebRTCManager} rtc
+   * @param {AbortSignal} [signal] external cancel (modal close button)
+   * @returns {Promise<string>} the decompressed SDP
+   */
+  async scanAndApply(rtc, signal = null) {
+    if (!rtc || typeof rtc.handleAnswer !== "function") {
+      throw new Error("SCANNER_NO_WEBRTC — no WebRTC manager bound.");
+    }
+
+    this._setStatus("Starting camera…");
+    this.scanner = new QrCameraScanner(this.videoEl, {
+      signal,
+      timeoutMs: 90_000,
+      sampleHz: 10,
+      onProgress: ({ got, total }) =>
+        this._setStatus(`Reading peer frames… ${got}/${total}`),
+    });
+
+    try {
+      const sdp = await this.scanner.start("answer");
+      this._setStatus("Applying peer answer…");
+      // Requirement 3: feed the decompressed SDP directly into WebRTC.
+      await rtc.handleAnswer(sdp);
+      this._setStatus("Peer answer applied — handshake complete.");
+      return sdp;
+    } catch (err) {
+      const msg = String(err?.message ?? err);
+      const friendly = {
+        QR_SCANNER_UNSUPPORTED: "This browser can't scan QR codes — try Chrome/Edge, or a jsQR-bundled build.",
+        CAMERA_PERMISSION_DENIED: "Camera denied — grant access and retry.",
+        CAMERA_NOT_FOUND: "No camera available on this device.",
+        QR_SCAN_TIMEOUT: "Timed out waiting for peer frames — re-display the QR sequence and retry.",
+        AbortError: "Scan cancelled.",
+      }[err?.name === "AbortError" ? "AbortError" : msg.split(" ")[0]] ?? msg;
+      this._setStatus(friendly);
+      throw err;
+    } finally {
+      // Requirement 4 (belt-and-braces): the scanner already stopped its
+      // own stream on completion/failure, but never trust one path alone.
+      this.scanner?.stop();
+    }
+  }
+
+  /** Cancel any in-flight scan and release the camera. */
+  cancel() {
+    this.scanner?.stop();
+    this.scanner = null;
+    this._setStatus("Scanner closed.");
+  }
+
+  /** Session purge teardown. */
+  destroy() {
+    this.cancel();
+  }
+}

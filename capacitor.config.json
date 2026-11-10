@@ -1,0 +1,22 @@
+{
+  "appId": "com.ghoststream.tactical",
+  "appName": "Ghost-Stream",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "android": {
+    "allowMixedContent": true,
+    "captureInput": true,
+    "webContentsDebuggingEnabled": false
+  },
+  "server": {
+    "androidScheme": "https",
+    "hostname": "localhost",
+    "cleartext": true
+  },
+  "plugins": {
+    "SplashScreen": {
+      "backgroundColor": "#1a102f",
+      "showSpinner": false
+    }
+  }
+}

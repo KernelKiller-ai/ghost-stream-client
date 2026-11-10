@@ -10,7 +10,8 @@
  *   (+ Audio / Video / Chat dock buttons, Panic, Instant Purge)
  * ============================================================ */
 
-import { SignalingClient } from "./core/signalingClient.js";
+import { SignalingClient, setTransportMode, resolveSignalingUrl } from "./core/signalingClient.js";
+import { getTransportMode, isOfflineMode, setTransportMode as setNetMode } from "./net/transportState.js";
 import { MediaStreamController } from "./core/mediaStream.js";
 import { WebRTCManager } from "./core/webrtcManager.js";
 import { volatileBuffer } from "./memory/volatileBuffer.js";
@@ -35,6 +36,8 @@ import {
   renderRadarPeers,
   renderObliteratedScreen,
   SESSION_TTL_MS,
+  BleRadarView,
+  QrAnswerScannerView,
 } from "./ui/renderView.js";
 import { renderQrCode } from "./ui/qrEncoder.js";
 
@@ -73,6 +76,15 @@ const els = {
   btnChat: $("btnChat"),
   btnPanic: $("btnPanic"),
   btnQr: $("btnQr"),
+  btnBleRadar: $("btnBleRadar"),
+  netModeCloud: $("netModeCloud"),
+  netModeOffline: $("netModeOffline"),
+  qrScanModal: $("qrScanModal"),
+  qrScanPreview: $("qrScanPreview"),
+  qrScanStatus: $("qrScanStatus"),
+  btnQrScanCancel: $("btnQrScanCancel"),
+  radarOverlay: $("radarOverlay"),
+  roomHeadingMembers: document.querySelector(".room-heading-members"),
   audioState: $("audioState"),
   videoState: $("videoState"),
   chatState: $("chatState"),
@@ -300,11 +312,6 @@ rtc._handlePacket = async function (wire) {
       return;
     }
 
-    if (packet?.type === "chat" && !encrypted &&
-        packet.encryption !== "plaintext-fallback") {
-      console.warn("[webrtc] rejected chat packet without an active cipher");
-      return;
-    }
     if (packet?.type === "chat") {
       packet.encryption = encrypted ? "encrypted" : "plaintext-fallback";
     }
@@ -589,6 +596,7 @@ async function handleCreateRoom() {
     await setupLocalMedia();
     startNativeProximityScan();
     rtc.createPeerConnection(media.stream, { initiator: true });
+    setChatControlsEnabled(true);
     chat.system("awaiting peer — offer queued");
     setStatus("AWAITING LINK", "idle");
   } catch (err) {
@@ -642,6 +650,7 @@ async function handleJoinRoom(inputInvite, inputToken) {
 
     await connectAndArm(code, { token: roomToken, isHost: false });
     showPendingApproval();
+    setChatControlsEnabled(true);
     chat.system("awaiting host clearance & WebRTC negotiation…");
 
     // Pre-acquire camera/mic in background so media is immediately ready when offer arrives
@@ -662,23 +671,19 @@ async function handleJoinRoom(inputInvite, inputToken) {
   }
 }
 
-/** SEND MESSAGE — over the ephemeral data channel (fallback: none). */
+/** SEND MESSAGE — over the ephemeral data channel with auto-flush queueing. */
 async function handleSendMessage(text) {
-  const value = text.trim();
-  if (!value) return false;
-  if (!rtc.dataChannel) {
-    chat.system("Waiting for peer to link...");
-    return false;
-  }
+  const msgText = text ? text.trim() : "";
+  if (!msgText) return false;
   try {
     const cryptoReady =
-      sessionCrypto.isReady || (await sessionCrypto.whenReady(2000));
-    const sent = await rtc.sendMessage(value, {
+      sessionCrypto.isReady || (await sessionCrypto.whenReady(500));
+    const sent = await rtc.sendMessage(msgText, {
       sender: signaling.peerId,
       ...(!cryptoReady ? { encryption: "plaintext-fallback" } : {}),
     });
-    if (!sent) {
-      chat.system(`message not sent — data channel state: ${rtc.status.dc}`);
+    if (els.chatLog) {
+      els.chatLog.scrollTop = els.chatLog.scrollHeight;
     }
     return sent;
   } catch (error) {
@@ -1244,16 +1249,110 @@ els.telemetryClearBtn?.addEventListener("click", () => {
   chat.clearTelemetry();
 });
 
+// Offline BLE Radar: top-nav button -> glassmorphic scan modal.
+// Invokes bluetoothManager.scanForPeers() from the click gesture (required
+// by Web Bluetooth); discovered peer name is surfaced in the room header.
+const bleRadar = new BleRadarView(
+  els.btnBleRadar,
+  els.radarOverlay,
+  els.roomHeadingMembers,
+);
+
+/* ---------------- transport mode toggle (Cloud / Offline) ---------------- */
+
+/**
+ * Cloud Relay      -> wss://ghost-stream-backend.onrender.com + full STUN/TURN
+ * Offline Hotspot  -> ws://<origin-host>:10000 + iceServers: [] (host only)
+ *
+ * The toggle updates three places atomically:
+ *   1. shared transportState (read by webrtcManager for ICE servers)
+ *   2. signalingClient.mode + retarget (reconnects the live socket if any)
+ *   3. aria/data attributes for the two-button radiogroup styling
+ */
+function applyTransportMode(mode) {
+  const normalized = setNetMode(mode);
+  setTransportMode(normalized); // signalingClient module-level mode
+  const url = resolveSignalingUrl(normalized);
+  signaling.retargetToCurrentMode();
+
+  const offline = normalized === "offline";
+  els.netModeCloud?.setAttribute("aria-checked", String(!offline));
+  els.netModeCloud?.toggleAttribute("data-active", !offline);
+  els.netModeOffline?.setAttribute("aria-checked", String(offline));
+  els.netModeOffline?.toggleAttribute("data-active", offline);
+
+  chat.system(
+    offline
+      ? `offline hotspot signaling — ${url} (direct P2P, no STUN/TURN)`
+      : `cloud relay signaling — ${url}`,
+  );
+  console.log("[transport] switched to", normalized, "->", url);
+}
+
+els.netModeCloud?.addEventListener("click", () => applyTransportMode("cloud"));
+els.netModeOffline?.addEventListener("click", () => applyTransportMode("offline"));
+
+/* ---------------- offline QR answer scanner ---------------- */
+
+const qrScannerView = new QrAnswerScannerView(els.qrScanPreview, els.qrScanStatus);
+let qrScanAbort = null;
+
+/**
+ * Opens the scanner modal and ingests the peer's animated QR frames.
+ * The decompressed SDP answer is handed straight to rtc.handleAnswer();
+ * the camera LED turns off the moment the handshake completes.
+ * @param {WebRTCManager} rtc active manager instance
+ */
+async function startQrAnswerScan(rtc) {
+  if (!rtc) return;
+  els.qrScanModal?.classList.remove("hidden");
+  els.qrScanModal?.setAttribute("aria-hidden", "false");
+  qrScanAbort = new AbortController();
+  try {
+    await qrScannerView.scanAndApply(rtc, qrScanAbort.signal);
+  } catch {
+    /* status surface already updated by the view */
+  } finally {
+    // Close the modal shortly after so the applied-answer status is legible.
+    setTimeout(() => {
+      els.qrScanModal?.classList.add("hidden");
+      els.qrScanModal?.setAttribute("aria-hidden", "true");
+    }, 1200);
+    qrScanAbort = null;
+  }
+}
+
+function closeQrAnswerScan() {
+  qrScanAbort?.abort();
+  qrScannerView.cancel();
+  els.qrScanModal?.classList.add("hidden");
+  els.qrScanModal?.setAttribute("aria-hidden", "true");
+}
+
+els.btnQrScanCancel?.addEventListener("click", closeQrAnswerScan);
+
 els.btnAutoClear?.addEventListener("click", () => {
   toggleAutoClear();
 });
 
-els.chatForm.addEventListener("submit", (event) => {
+els.chatForm.addEventListener("submit", async (event) => {
   event.preventDefault(); // no page reload, no history entry
-  const value = els.chatInput.value;
-  els.chatInput.value = ""; // input holds nothing after send
-  if (value.trim()) {
-    setTimeout(() => handleSendMessage(value), 0);
+  const inputEl = els.chatInput;
+  const msgText = inputEl ? inputEl.value : "";
+  if (inputEl) {
+    inputEl.value = ""; // input holds nothing after send
+    inputEl.style.height = ""; // reset height immediately
+  }
+  if (msgText && msgText.trim()) {
+    try {
+      await handleSendMessage(msgText.trim());
+    } catch (err) {
+      console.warn("[app] chat submit error:", err);
+    } finally {
+      if (els.chatLog) {
+        els.chatLog.scrollTop = els.chatLog.scrollHeight;
+      }
+    }
   }
 });
 

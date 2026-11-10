@@ -16,6 +16,7 @@
   </head>
   <body>
     <div class="fx-overlay" aria-hidden="true"></div>
+    <div class="radar-overlay" id="radarOverlay" aria-hidden="true"></div>
 
     <div class="app-shell" id="shell">
       <!-- TOP NAVIGATION BAR -->
@@ -55,6 +56,10 @@
         <div class="topbar-right">
           <!-- Room Action Buttons -->
           <div class="room-actions-group">
+            <div class="net-mode-toggle glass-panel" role="radiogroup" aria-label="Signaling transport" title="Cloud Relay uses the internet rendezvous server. Offline Hotspot talks to a LAN signaling server on port 10000 with direct P2P only.">
+              <button class="net-mode-btn" id="netModeCloud" type="button" role="radio" aria-checked="true" data-active="true" title="Render cloud relay (internet)">☁ CLOUD</button>
+              <button class="net-mode-btn" id="netModeOffline" type="button" role="radio" aria-checked="false" title="Offline hotspot — LAN signaling on ws://<host>:10000, direct host-candidate P2P only">📡 OFFLINE</button>
+            </div>
             <button class="header-btn" id="btnCreateRoom" type="button" title="Create a new secure room">NEW</button>
             <button class="header-btn" id="btnJoinRoom" type="button" title="Join room by code or invite link">JOIN</button>
             <button class="header-btn header-btn-icon" id="btnQr" type="button" disabled aria-label="Show room invite QR code" title="QR Invite Code">
@@ -68,6 +73,7 @@
                 <rect x="6" y="17" width="1" height="1"></rect>
               </svg>
             </button>
+            <button class="header-btn header-btn-radar" id="btnBleRadar" type="button" data-radar-state="idle" title="Offline BLE Radar: discover nearby peers via Bluetooth">📡 BLE RADAR</button>
             <button class="header-btn header-btn-toggle" id="btnAutoClear" type="button" data-active="true" aria-pressed="true" title="Auto-authorize peer links without manual prompt">
               AUTO: ON
             </button>
@@ -224,6 +230,19 @@
           <ul id="radarPeers"></ul>
         </div>
       </main>
+    </div>
+
+    <!-- MODAL: OFFLINE QR ANSWER SCANNER -->
+    <div class="qrscan-overlay hidden" id="qrScanModal" role="dialog" aria-modal="true" aria-labelledby="qrScanTitle" aria-hidden="true">
+      <section class="qrscan-card glass-panel">
+        <div class="modal-heading">
+          <h2 id="qrScanTitle">Air-gapped peer answer</h2>
+          <p>Point the camera at the peer's animated QR sequence. The camera shuts off the moment the handshake completes.</p>
+        </div>
+        <video id="qrScanPreview" autoplay playsinline muted></video>
+        <p class="qrscan-status" id="qrScanStatus">Starting camera…</p>
+        <button class="header-btn" id="btnQrScanCancel" type="button">CANCEL SCAN</button>
+      </section>
     </div>
 
     <!-- MODAL: ROTATING QR INVITE -->

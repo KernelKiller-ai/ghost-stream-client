@@ -1455,6 +1455,267 @@ input:focus-visible {
   }
 }
 
+/* ============================================================
+ * BLE RADAR — offline proximity scan UI (glassmorphic overlay)
+ * ============================================================ */
+
+/* Offline QR answer scanner modal */
+.qrscan-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(18, 9, 36, 0.78);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+.qrscan-overlay.hidden {
+  display: none;
+}
+.qrscan-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: min(92vw, 420px);
+  padding: 24px;
+  border-radius: 20px;
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  text-align: center;
+}
+.qrscan-card video {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  border-radius: 14px;
+  background: #120924;
+  border: 1px solid rgba(139, 92, 246, 0.25);
+}
+.qrscan-card .modal-heading p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.qrscan-status {
+  min-height: 1.4em;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--lavender);
+}
+
+/* Transport mode toggle — Cloud vs Offline Hotspot */
+.net-mode-toggle {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 10px;
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  background: rgba(255, 255, 255, 0.06);
+  gap: 2px;
+}
+.net-mode-btn {
+  padding: 5px 12px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease;
+  white-space: nowrap;
+}
+.net-mode-btn[data-active="true"],
+.net-mode-btn[aria-checked="true"] {
+  background: rgba(139, 92, 246, 0.22);
+  color: var(--lavender);
+  box-shadow: inset 0 0 0 1px rgba(139, 92, 246, 0.45);
+}
+.net-mode-btn:hover {
+  color: var(--text);
+}
+
+.header-btn-radar[data-radar-state="scanning"],
+.header-btn-radar[data-radar-state="pairing"] {
+  border-color: rgba(139, 92, 246, 0.65);
+  color: var(--lavender);
+  animation: radar-btn-pulse 1.4s ease-in-out infinite;
+}
+.header-btn-radar[data-radar-state="connected"] {
+  border-color: rgba(139, 92, 246, 0.85);
+  color: var(--lavender);
+  background: rgba(139, 92, 246, 0.18);
+}
+.header-btn-radar[data-radar-state="failed"] {
+  border-color: rgba(239, 68, 68, 0.6);
+  color: var(--danger);
+}
+@keyframes radar-btn-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.35); }
+  50% { box-shadow: 0 0 12px 2px rgba(139, 92, 246, 0.55); }
+}
+
+.radar-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(18, 9, 36, 0.72);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+.radar-overlay--active {
+  display: flex;
+}
+body.radar-lock-scroll {
+  overflow: hidden;
+}
+
+.radar-glass {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  padding: 42px 48px;
+  border-radius: 24px;
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow:
+    0 24px 60px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+  max-width: min(90vw, 380px);
+  text-align: center;
+}
+
+/* Concentric expanding rings in --violet #8B5CF6 */
+.radar-scope {
+  position: relative;
+  width: 168px;
+  height: 168px;
+}
+.radar-ring {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: 2px solid #8b5cf6;
+  opacity: 0;
+  animation: radar-ring-expand 2.4s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
+}
+.radar-ring--2 { animation-delay: 0.8s; }
+.radar-ring--3 { animation-delay: 1.6s; }
+@keyframes radar-ring-expand {
+  0% { transform: scale(1); opacity: 0.9; }
+  70% { opacity: 0.35; }
+  100% { transform: scale(3); opacity: 0; }
+}
+
+.radar-core {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #c4b5fd 0%, #8b5cf6 60%, transparent 100%);
+  box-shadow: 0 0 18px 4px rgba(139, 92, 246, 0.6);
+}
+
+.radar-sweep {
+  position: absolute;
+  inset: 6px;
+  border-radius: 50%;
+  border: 1px dashed rgba(167, 139, 250, 0.4);
+  background: conic-gradient(from 0deg, rgba(139, 92, 246, 0.45), transparent 70deg, transparent 360deg);
+  animation: radar-sweep-spin 2.8s linear infinite;
+  mask-image: radial-gradient(circle, transparent 55%, black 56%);
+  -webkit-mask-image: radial-gradient(circle, transparent 55%, black 56%);
+}
+@keyframes radar-sweep-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Per-state scope treatments */
+.radar-scope[data-state="pairing"] .radar-ring { animation-duration: 1.1s; }
+.radar-scope[data-state="connected"] .radar-ring {
+  border-color: #a78bfa;
+  animation: none;
+  opacity: 0.85;
+}
+.radar-scope[data-state="scan-failed"] .radar-ring,
+.radar-scope[data-state="idle"] .radar-ring {
+  animation: none;
+  opacity: 0.25;
+}
+.radar-scope[data-state="scan-failed"] .radar-core {
+  background: radial-gradient(circle, #fca5a5 0%, #ef4444 60%, transparent 100%);
+  box-shadow: 0 0 18px 4px rgba(239, 68, 68, 0.55);
+}
+
+.radar-state-label {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--lavender);
+}
+.radar-glass[data-state="scan-failed"] .radar-state-label { color: var(--danger); }
+
+.radar-hint {
+  min-height: 2.6em;
+  font-size: 13px;
+  color: var(--muted);
+  max-width: 260px;
+}
+
+.radar-peer {
+  min-height: 1.4em;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.radar-close {
+  padding: 10px 22px;
+  border-radius: 12px;
+  border: 1px solid rgba(139, 92, 246, 0.4);
+  background: rgba(139, 92, 246, 0.12);
+  color: var(--lavender);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+.radar-close:hover {
+  background: rgba(139, 92, 246, 0.22);
+  border-color: rgba(139, 92, 246, 0.7);
+}
+
+/* Peer badge shown in the active room header */
+.room-heading-ble-peer {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(139, 92, 246, 0.5);
+  background: rgba(139, 92, 246, 0.16);
+  color: var(--lavender);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

@@ -14,6 +14,10 @@
  * this module owns the RTCPeerConnection itself.
  * ============================================================ */
 
+import {
+  bindWebRTCManager,
+} from "./bluetoothManager.js";
+import { isOfflineMode } from "../net/transportState.js";
 import { volatileBuffer } from "../memory/volatileBuffer.js";
 import {
   openPacket,
@@ -56,7 +60,23 @@ export const ICE_SERVERS = [
   },
 ];
 
-/** Valid packet types accepted on the data channel. */
+/**
+ * Offline Hotspot mode: NO STUN/TURN at all. On a shared hotspot both peers
+ * share a subnet so host candidates connect directly; skipping external
+ * servers avoids multi-second Google STUN timeouts and keeps the exchange
+ * fully offline.
+ */
+export const ICE_SERVERS_OFFLINE = [];
+
+/**
+ * Active ICE configuration selector.
+ * @param {boolean} offline true when Offline Hotspot transport is active
+ * @returns {RTCIceServer[]}
+ */
+export function iceServersFor(offline) {
+  return offline ? ICE_SERVERS_OFFLINE : ICE_SERVERS;
+}
+
 const PACKET_TYPES = new Set([
   "chat",
   "presence",
@@ -93,6 +113,8 @@ export class WebRTCManager {
     this.pc = null;
     /** @type {RTCDataChannel|null} */
     this.dataChannel = null;
+    /** @type {boolean} indicates whether data channel is open and ready */
+    this.isDataChannelReady = false;
     /** @type {MediaStream|null} local stream added to the connection */
     this.localStream = null;
     this._videoSender = null;
@@ -138,27 +160,13 @@ export class WebRTCManager {
     this._pendingCandidates = [];
     this._remoteDescSet = false;
     this._answerPending = false;
+    this.isDataChannelReady = false;
 
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-    // Local media out.
-    this.localStream = localStream;
-    this._videoSender = null;
-    if (localStream) {
-      for (const track of localStream.getTracks()) {
-        try {
-          const sender = this.pc.addTrack(track, localStream);
-          if (track.kind === "video") this._videoSender = sender;
-        } catch (err) {
-          console.warn("[webrtc] failed to add track:", err);
-        }
-      }
-    }
-    if (!this._videoSender && typeof this.pc.addTransceiver === "function") {
-      this._videoSender = this.pc.addTransceiver("video", {
-        direction: "sendrecv",
-      }).sender;
-    }
+    this.pc = new RTCPeerConnection({
+      iceServers: iceServersFor(isOfflineMode()),
+      // Offline LAN links negotiate instantly — don't linger in checking.
+      ...(isOfflineMode() ? { iceCandidatePoolSize: 0 } : {}),
+    });
 
     // Remote media in -> UI.
     this.pc.ontrack = (event) => this._handleRemoteTrack(event);
@@ -193,17 +201,40 @@ export class WebRTCManager {
       this.signaling.sendIceCandidate(this.remotePeerId, event.candidate);
     };
 
+    // CRITICAL: Bind ondatachannel BEFORE handling or creating SDP offers/answers.
+    this.pc.ondatachannel = (event) => {
+      console.info(
+        `[webrtc] ondatachannel received (id: ${event.channel?.id}, label: ${event.channel?.label})`,
+      );
+      this.dataChannel = event.channel;
+      this._setupDataChannelEvents(this.dataChannel);
+    };
+
+    // Local media out.
+    this.localStream = localStream;
+    this._videoSender = null;
+    if (localStream) {
+      for (const track of localStream.getTracks()) {
+        try {
+          const sender = this.pc.addTrack(track, localStream);
+          if (track.kind === "video") this._videoSender = sender;
+        } catch (err) {
+          console.warn("[webrtc] failed to add track:", err);
+        }
+      }
+    }
+    if (!this._videoSender && typeof this.pc.addTransceiver === "function") {
+      this._videoSender = this.pc.addTransceiver("video", {
+        direction: "sendrecv",
+      }).sender;
+    }
+
     // Data channel: initiator creates it; receiver waits in ondatachannel.
     if (this.isInitiator) {
       this.dataChannel = this.pc.createDataChannel("ephemeral-chat", {
         ordered: true,
       });
       this._setupDataChannelEvents(this.dataChannel);
-    } else {
-      this.pc.ondatachannel = (event) => {
-        this.dataChannel = event.channel;
-        this._setupDataChannelEvents(this.dataChannel);
-      };
     }
 
     return this.pc;
@@ -263,6 +294,7 @@ export class WebRTCManager {
    * Full close: data channel then peer connection, references dropped.
    */
   closePeerConnection() {
+    this.isDataChannelReady = false;
     if (this.dataChannel) {
       try {
         if (this.dataChannel.readyState !== "closed") this.dataChannel.close();
@@ -304,7 +336,19 @@ export class WebRTCManager {
 
   /** Receiver: consume a remote offer, answer, publish the answer. */
   async handleOffer(fromPeerId, sdp) {
-    if (!this.pc) throw new Error("RTCPeerConnection not initialized for offer");
+    if (!this.pc) {
+      this.createPeerConnection(this.localStream, { remotePeerId: fromPeerId, initiator: false });
+    }
+    // Guarantee ondatachannel is wired before setRemoteDescription
+    if (!this.pc.ondatachannel) {
+      this.pc.ondatachannel = (event) => {
+        console.info(
+          `[webrtc] ondatachannel received in handleOffer (id: ${event.channel?.id}, label: ${event.channel?.label})`,
+        );
+        this.dataChannel = event.channel;
+        this._setupDataChannelEvents(this.dataChannel);
+      };
+    }
     this.remotePeerId = this.remotePeerId || fromPeerId;
     await this.pc.setRemoteDescription(new RTCSessionDescription(sdp));
     this._remoteDescSet = true;
@@ -322,6 +366,12 @@ export class WebRTCManager {
   async handleAnswer(sdp) {
     const pc = this.pc;
     if (!pc) return;
+    if (!pc.ondatachannel) {
+      pc.ondatachannel = (event) => {
+        this.dataChannel = event.channel;
+        this._setupDataChannelEvents(this.dataChannel);
+      };
+    }
     if (pc.signalingState !== "have-local-offer" || this._answerPending) {
       console.warn(
         `[webrtc] Skipping remote description, state is: ${pc.signalingState}`,
@@ -398,37 +448,67 @@ export class WebRTCManager {
 
   /** @private */
   _setupDataChannelEvents(channel) {
+    if (!channel) return;
+
     channel.onopen = async () => {
+      console.info(
+        `[webrtc] DataChannel opened (id: ${channel.id}, label: ${channel.label})`,
+      );
+      this.isDataChannelReady = true;
+
       try {
         await this.onDataChannelOpen?.();
       } catch (error) {
         console.error("[webrtc] data channel open callback failed:", error);
       }
-      await this.sendPacket({
-        type: "presence",
-        sender: this.signaling?.peerId,
-        text: "linked",
-      });
-        await this._flushPendingMessages(channel);
+
+      try {
+        await this.sendPacket({
+          type: "presence",
+          sender: this.signaling?.peerId,
+          text: "linked",
+        });
+      } catch (error) {
+        console.warn("[webrtc] presence packet send failed:", error?.name || error?.message);
+      }
+
+      await this._flushPendingMessages(channel);
       this._startHeartbeat(channel);
     };
+
     channel.onclose = () => {
+      console.info(
+        `[webrtc] DataChannel closed (id: ${channel.id}, label: ${channel.label})`,
+      );
+      this.isDataChannelReady = false;
       this._stopHeartbeat();
       this.onDataChannelClose?.();
     };
+
     channel.onerror = (event) => {
-      this._stopHeartbeat();
       console.error(
         `[webrtc] data channel error (readyState: ${channel.readyState})`,
         event,
       );
+      this.isDataChannelReady = false;
+      this._stopHeartbeat();
       this.onDataChannelClose?.();
     };
+
     channel.onmessage = (event) => {
       Promise.resolve(this._handlePacket(event.data)).catch((error) => {
         console.error("[webrtc] incoming data channel message failed:", error);
       });
     };
+
+    // If channel is already open when listener is registered
+    if (channel.readyState === "open" && !this.isDataChannelReady) {
+      queueMicrotask(() => {
+        if (channel.readyState === "open" && !this.isDataChannelReady) {
+          channel.onopen?.();
+        }
+      });
+    }
   }
 
   /**
@@ -473,9 +553,13 @@ export class WebRTCManager {
     }
 
     if (packet.type === "ping") {
-      await this.sendPacket({
-        type: "pong",
-        pingId: packet.pingId,
+      Promise.resolve(
+        this.sendPacket({
+          type: "pong",
+          pingId: packet.pingId,
+        }),
+      ).catch((err) => {
+        console.warn("[webrtc] heartbeat pong failed:", err?.name || err?.message);
       });
       return true;
     }
@@ -506,48 +590,77 @@ export class WebRTCManager {
 
   /**
    * Send a text message over the ephemeral data channel.
+   * Drains immediately if open; otherwise buffers safely and auto-flushes on connect.
    * @param {string} text
-   * @param {{ sender?: string }} [opts]
+   * @param {{ sender?: string, encryption?: string }} [opts]
    * @returns {Promise<boolean>}
    */
   async sendMessage(text, opts = {}) {
+    if (!text || !text.trim()) return false;
+
+    const trimmed = text.trim();
     const packet = {
       type: "chat",
-      sender: opts.sender || this.signaling?.peerId,
-      text: String(text),
+      sender: opts.sender || this.signaling?.peerId || "anon",
+      text: trimmed,
       at: Date.now(),
       ...(opts.encryption ? { encryption: opts.encryption } : {}),
     };
 
-    let sent = false;
-    if (this.dataChannel?.readyState === "open") {
-      sent = await this.sendPacket(packet);
+    const kind =
+      packet.encryption === "plaintext-fallback"
+        ? "self-plaintext"
+        : "self";
+
+    // 1. Channel is open and ready to transmit immediately
+    if (this.dataChannel && this.dataChannel.readyState === "open") {
+      const sent = await this.sendPacket(packet);
+      if (sent) {
+        const entry = volatileBuffer.pushMessage({
+          sender: packet.sender || "self",
+          text: packet.text,
+          at: packet.at,
+          kind,
+        });
+        this.onChatMessage?.(entry);
+        return true;
+      }
     }
-    if (!sent) this._pendingMessages.push(packet);
+
+    // 2. Channel is connecting, closed, or send was deferred: queue for auto-flush
+    this._pendingMessages.push(packet);
+    console.warn("[webrtc] DataChannel connecting; message queued for auto-flush");
+
+    // Render an optimistic local bubble into volatile buffer and UI
     const entry = volatileBuffer.pushMessage({
       sender: packet.sender || "self",
       text: packet.text,
       at: packet.at,
-      kind:
-        packet.encryption === "plaintext-fallback"
-          ? "self-plaintext"
-          : "self",
+      kind,
     });
     this.onChatMessage?.(entry);
+
     return true;
   }
 
   /** Drain queued chat messages through an open channel. */
   async _flushPendingMessages(channel) {
+    const targetChannel = channel || this.dataChannel;
+    if (!targetChannel || targetChannel.readyState !== "open") return;
     if (this._flushingMessages) return;
     this._flushingMessages = true;
     try {
-      while (this._pendingMessages.length && channel.readyState === "open") {
+      while (this._pendingMessages.length && targetChannel.readyState === "open") {
         const packet = this._pendingMessages[0];
         const sent = await this.sendPacket(packet);
-        if (!sent) break;
+        if (!sent) {
+          console.warn("[webrtc] could not send queued packet during flush; pausing drain");
+          break;
+        }
         this._pendingMessages.shift();
       }
+    } catch (err) {
+      console.error("[webrtc] error flushing pending messages:", err);
     } finally {
       this._flushingMessages = false;
     }
@@ -558,7 +671,7 @@ export class WebRTCManager {
     return this._flushPendingMessages(this.dataChannel);
   }
 
-  /** Start RTT heartbeat. */
+  /** Start RTT heartbeat with non-blocking isolation. */
   _startHeartbeat(channel) {
     this._stopHeartbeat();
     const sendPing = () => {
@@ -574,7 +687,8 @@ export class WebRTCManager {
         .then((sent) => {
           if (!sent) this._pendingPings.delete(pingId);
         })
-        .catch(() => {
+        .catch((err) => {
+          console.warn("[webrtc] heartbeat ping failed:", err?.name || err?.message);
           this._pendingPings.delete(pingId);
         });
     };
@@ -593,8 +707,9 @@ export class WebRTCManager {
 
   /**
    * Low-level packet send: automatically encrypts via sealPacket()
+   * Synchronously returns false if channel is closed.
    * @param {object} packet
-   * @returns {Promise<boolean>}
+   * @returns {boolean|Promise<boolean>}
    */
   sendPacket(packet) {
     if (!this.dataChannel || this.dataChannel.readyState !== "open") {
@@ -611,7 +726,11 @@ export class WebRTCManager {
             !sessionCrypto.isReady &&
             packet.encryption !== "plaintext-fallback"
           ) {
-            await sessionCrypto.whenReady(2000);
+            try {
+              await sessionCrypto.whenReady(1500);
+            } catch {
+              /* timeout */
+            }
           }
           if (
             sessionCrypto.isReady &&
@@ -620,8 +739,10 @@ export class WebRTCManager {
             packet.encryption = "encrypted";
             wire = await sealPacket(packet);
           } else {
+            // Fallback to immediate transport with unencrypted tag rather than silently holding
             packet.encryption = "plaintext-fallback";
             wire = JSON.stringify({ p: packet, e: 0 });
+            console.warn("[webrtc] sending chat frame with plaintext-fallback tag");
           }
         } else {
           wire = JSON.stringify({ p: packet, e: 0 });
@@ -643,6 +764,19 @@ export class WebRTCManager {
 
   /** @private Wire signaling events into the SDP/ICE handlers. */
   _bindSignaling() {
+    // Offline BLE transport: route inbound chunked SDP into handleOffer/handleAnswer
+    // via the bluetoothManager bridge — zero internet dependency.
+    bindWebRTCManager({
+      handleOffer: (from, sdp) =>
+        this.handleOffer(from, sdp).catch((err) =>
+          console.warn("[webrtc] BLE offer handling failed:", err?.name || err?.message),
+        ),
+      handleAnswer: (sdp) =>
+        this.handleAnswer(sdp).catch((err) =>
+          console.warn("[webrtc] BLE answer handling failed:", err?.name || err?.message),
+        ),
+    });
+
     if (!this.signaling) return;
     this.signaling.onOffer = (from, sdp) => {
       if (!this.pc) {

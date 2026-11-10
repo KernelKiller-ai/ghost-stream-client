@@ -24,8 +24,61 @@
  * ============================================================ */
 
 /**
- * Resolved signaling endpoint strictly prioritizing Vite's environment variable.
- * Fallback connects to local backend or dedicated Render signaling server with root path.
+ * Active signaling transport mode.
+ *   "cloud"   — Render relay (internet)
+ *   "offline" — local hotspot signaling server (LAN, port 10000)
+ * Mutated at runtime by app.js via setTransportMode(); kept in sync with
+ * the launch-view toggle so reconnects target the chosen transport.
+ * @type {"cloud" | "offline"}
+ */
+export let transportMode = "cloud";
+
+/** Hostname of the current origin — used to build the LAN signaling URL. */
+const ORIGIN_HOST =
+  typeof window !== "undefined" ? window.location.hostname : "localhost";
+
+/**
+ * URL used when Offline Hotspot mode is active.
+ * Uses the SAME hostname the page was served from (the hotspot gateway),
+ * so phones joined to the hotspot reach the signaling server with zero config.
+ * Pages served from localhost during development also land here naturally.
+ */
+export function offlineSignalingUrl() {
+  return `ws://${ORIGIN_HOST}:10000`;
+}
+
+/** Render cloud relay endpoint (internet). */
+export function cloudSignalingUrl() {
+  return ORIGIN_HOST === "localhost"
+    ? "ws://localhost:10000"
+    : "wss://ghost-stream-backend.onrender.com";
+}
+
+/**
+ * Resolves the signaling URL for a transport mode.
+ * An explicit VITE_SIGNALING_URL always wins (ops escape hatch).
+ * @param {"cloud"|"offline"} mode
+ * @returns {string}
+ */
+export function resolveSignalingUrl(mode = transportMode) {
+  if (import.meta.env?.VITE_SIGNALING_URL) return import.meta.env.VITE_SIGNALING_URL;
+  return mode === "offline" ? offlineSignalingUrl() : cloudSignalingUrl();
+}
+
+/**
+ * Switches the global transport at runtime. Safe to call repeatedly.
+ * @param {"cloud"|"offline"} mode
+ * @returns {string} the URL the mode resolves to
+ */
+export function setTransportMode(mode) {
+  if (mode !== "cloud" && mode !== "offline") return resolveSignalingUrl();
+  transportMode = mode;
+  return resolveSignalingUrl(mode);
+}
+
+/**
+ * Legacy named export kept for compatibility: reflects the CURRENT mode.
+ * Prefer resolveSignalingUrl() / setTransportMode() for dynamic switching.
  */
 export const SIGNALING_URL =
   import.meta.env?.VITE_SIGNALING_URL ||
@@ -66,7 +119,7 @@ export class SignalingClient {
    * @param {boolean}  [options.autoReconnect=true]
    */
   constructor(options = {}) {
-    this.url = options.url || DEFAULT_URL;
+    this.url = options.url || resolveSignalingUrl();
     this.room = options.room || null;
     this.roomToken = options.token || null;
     this.isHost = options.isHost === true;
@@ -102,6 +155,23 @@ export class SignalingClient {
   }
 
   /* ---------------- lifecycle ---------------- */
+
+  /**
+   * Re-point the client at the currently selected transport (cloud/offline)
+   * and drop any live socket so the next connect() uses the new URL.
+   * Called by app.js when the launch-view toggle flips.
+   * @returns {string} the URL the client now targets
+   */
+  retargetToCurrentMode() {
+    this.url = resolveSignalingUrl();
+    if (this._ws) {
+      this.disconnect();
+      this.connect().catch(() => {
+        /* reconnect scheduler handles transient failures */
+      });
+    }
+    return this.url;
+  }
 
   /** @returns {Promise<void>} resolves once the socket is open. */
   connect() {

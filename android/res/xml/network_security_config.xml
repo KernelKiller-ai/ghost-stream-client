@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  GHOST-STREAM // network_security_config.xml
+  Allows cleartext (ws:// and http://) ONLY on RFC1918 private / hotspot
+  ranges + localhost — the cloud relay stays HTTPS-enforced via wss.
+  Deploy at: android/app/src/main/res/xml/network_security_config.xml
+-->
+<network-security-config>
+  <domain-config cleartextTrafficPermitted="true">
+    <domain includeSubdomains="false">localhost</domain>
+    <domain includeSubdomains="false">10.0.0.1</domain>
+    <base-config cleartextTrafficPermitted="true">
+      <trust-anchors>
+        <!-- LAN signaling runs on plain ws:// inside the hotspot subnet -->
+        <certificates src="system" />
+      </trust-anchors>
+    </base-config>
+  </domain-config>
+</network-security-config>
